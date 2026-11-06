@@ -1080,9 +1080,8 @@ pub fn decode(input: &[u8]) -> Result<(Message, usize), ProtocolError> {
 fn valid_user(user: &[u8]) -> bool {
     !user.is_empty()
         && user.len() <= 256
-        && user
-            .iter()
-            .all(|byte| *byte != 0 && !byte.is_ascii_control())
+        && std::str::from_utf8(user).is_ok()
+        && user.iter().all(|byte| !byte.is_ascii_control())
 }
 
 fn valid_term(term: &[u8]) -> bool {
@@ -1174,6 +1173,7 @@ pub enum ClientState {
 pub enum ServerState {
     Start,
     AwaitAuth,
+    AuthPending,
     AwaitOpen,
     Running,
     Closed,
@@ -1219,7 +1219,9 @@ impl ServerState {
     pub fn sent(&mut self, m: &Message) -> Result<(), ProtocolError> {
         *self = match (*self, m) {
             (Self::AwaitAuth, Message::Challenge { .. }) => Self::AwaitAuth,
-            (Self::AwaitOpen, Message::AuthOk) => Self::AwaitOpen,
+            (Self::AuthPending, Message::AuthOk) => Self::AwaitOpen,
+            (Self::AuthPending, Message::AuthFail { .. } | Message::Close { .. }) => Self::Closed,
+            (Self::AwaitOpen, Message::Close { .. }) => Self::Closed,
             (Self::AwaitAuth, Message::AuthFail { .. } | Message::Close { .. }) => Self::Closed,
             (Self::Running, Message::Exit { .. } | Message::Close { .. }) => Self::Closed,
             _ => return Err(ProtocolError::InvalidState),
@@ -1230,7 +1232,7 @@ impl ServerState {
     pub fn accept(&mut self, m: &Message) -> Result<(), ProtocolError> {
         *self = match (*self, m) {
             (Self::Start, Message::Hello { version: 1, .. }) => Self::AwaitAuth,
-            (Self::AwaitAuth, Message::AuthRequest { .. }) => Self::AwaitOpen,
+            (Self::AwaitAuth, Message::AuthRequest { .. }) => Self::AuthPending,
             (Self::AwaitOpen, Message::OpenShell { .. }) => Self::Running,
             (Self::Running, Message::Resize { .. } | Message::Signal { .. }) => Self::Running,
             (Self::Running, Message::Close { .. }) => Self::Closed,
@@ -1243,6 +1245,43 @@ impl ServerState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn usernames_require_utf8_and_no_controls() {
+        assert!(valid_user("josé".as_bytes()));
+        for user in [&b""[..], &b"bad\0name"[..], &b"bad\nname"[..], &[0xff][..]] {
+            assert!(!valid_user(user));
+        }
+    }
+
+    #[test]
+    fn server_waits_for_authorization_before_open() {
+        let mut server = ServerState::AwaitAuth;
+        let auth = Message::AuthRequest {
+            user: [0; 256],
+            user_len: 1,
+            public_key: [0; 32],
+            client_nonce: [0; 32],
+            signature: [0; 64],
+        };
+        server.accept(&auth).unwrap();
+        assert_eq!(server, ServerState::AuthPending);
+        let open = Message::OpenShell {
+            term: [0; 64],
+            term_len: 0,
+            rows: 24,
+            cols: 80,
+        };
+        assert!(server.accept(&open).is_err());
+        assert!(server.accept(&auth).is_err());
+        let mut denied = server;
+        denied.sent(&Message::AuthFail { reason_class: 1 }).unwrap();
+        assert_eq!(denied, ServerState::Closed);
+        server.sent(&Message::AuthOk).unwrap();
+        assert_eq!(server, ServerState::AwaitOpen);
+        server.sent(&Message::Close { code: 0 }).unwrap();
+        assert_eq!(server, ServerState::Closed);
+    }
+
     #[test]
     fn message_round_trips() {
         let messages = [

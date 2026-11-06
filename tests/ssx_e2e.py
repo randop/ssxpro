@@ -246,7 +246,8 @@ def main():
             [
                 # The client opens stream 4 itself; the prompt must appear
                 # without the user typing anything.
-                ("Welcome to fish", b"uname -s\r"),
+                (None, b"printf 'SSX_%s\\n' READY\r"),
+                ("SSX_READY", b"uname -s\r"),
                 ("Linux", b"printf 'MARK_%s\\n' 42\r"),
                 ("MARK_42", b"exit\r"),
             ],
@@ -259,7 +260,7 @@ def main():
         run_scenario(
             "B-remote-exit-status",
             base,
-            [("Welcome to fish", b"exit 7\r")],
+            [(None, b"printf 'SSX_%s\\n' READY\r"), ("SSX_READY", b"exit 7\r")],
             expect_status=7,
             expect_output=("kind=Status, value=7",),
         )
@@ -283,10 +284,10 @@ def main():
             "E-idle-keepalive",
             idle_base,
             [
-                # No input before the command: the prompt must arrive on its
-                # own, then the session must survive a quiet period longer
+                # After shell readiness, the session must survive a quiet period longer
                 # than the client idle timeout thanks to keepalive pings.
-                ("Welcome to fish", None),
+                (None, b"printf 'SSX_%s\\n' READY\r"),
+                ("SSX_READY", None),
                 15,
                 (None, b"printf 'IDLE_%s\\n' ok\r"),
                 ("IDLE_ok", b"exit\r"),

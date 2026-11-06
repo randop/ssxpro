@@ -37,7 +37,7 @@ auth:
   max_attempts: 1
   allow_root: false
 features:
-  iopf_buf_ring: false      # Linux 5.10+ incremental provided-buffer ring
+  iopf_buf_ring: false      # Linux 6.12+ incremental provided-buffer ring
   reuseport_steering: false # requires CAP_BPF capability
   hugepages: false         # hugepages support
 session:

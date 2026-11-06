@@ -209,6 +209,12 @@ pub fn connect_and_echo(
     let auth_deadline =
         Instant::now() + Duration::from_secs(u64::from(client_config.handshake_timeout_secs));
     while Instant::now() < auth_deadline {
+        if conn.is_closed() {
+            if let Some(error) = conn.peer_error() {
+                return Err(format!("connection closed: {error:?}").into());
+            }
+            return Err("connection closed".into());
+        }
         if pin_checked && !sent_hello {
             let hello = Message::Hello {
                 version: 1,
@@ -363,7 +369,7 @@ pub fn connect_and_echo(
         loop {
             match input_rx.try_recv() {
                 Ok(InputEvent::Data(bytes)) => {
-                    let mut encoded = [0u8; 256];
+                    let mut encoded = vec![0u8; bytes.len() + 1];
                     let (length, action) = escapes.process(&bytes, &mut encoded);
                     input_pending.extend(&encoded[..length]);
                     match action {

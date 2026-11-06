@@ -60,7 +60,7 @@ impl RuntimeRing {
             // registration (PTY masters, terminal descriptors) requires this
             // entry to be present.
             const IORING_REGISTER_FILES_UPDATE_OP: u8 = 6;
-            let allowed = [9u8, 10, 11, 14, 22, 23, 40, 47, 48];
+            let allowed = [9u8, 10, 11, 14, 15, 22, 23, 40, 47, 48];
             let mut restrictions = allowed
                 .into_iter()
                 .map(Restriction::sqe_op)
@@ -166,34 +166,54 @@ impl RuntimeRing {
         Ok(cqe.result())
     }
 
-    /// Submit one operation without waiting for a completion. Returns the CQE
-    /// result if one is immediately available, or `WouldBlock` if the kernel
-    /// has not yet completed the operation.
-    pub fn submit_nowait(&mut self, entry: &io_uring::squeue::Entry) -> std::io::Result<i32> {
-        {
-            let mut queue = self.inner.submission();
-            // SAFETY: submit_nowait does not wait for a completion, but the
-            // caller must keep SQE-referenced memory alive until the CQE is
-            // consumed.
-            unsafe {
-                queue
-                    .push(entry)
-                    .map_err(|_| std::io::Error::other("submission queue is full"))?;
+    /// Complete both linked operations before releasing either backing buffer.
+    pub fn submit_with_timeout(
+        &mut self,
+        entry: &io_uring::squeue::Entry,
+        timeout: std::time::Duration,
+    ) -> std::io::Result<i32> {
+        let timespec = io_uring::types::Timespec::from(timeout);
+        let operation = entry
+            .clone()
+            .flags(io_uring::squeue::Flags::FIXED_FILE | io_uring::squeue::Flags::IO_LINK)
+            .user_data(1);
+        let timer = io_uring::opcode::LinkTimeout::new(&timespec)
+            .build()
+            .user_data(2);
+        unsafe {
+            self.inner
+                .submission()
+                .push_multiple(&[operation, timer])
+                .map_err(|_| std::io::Error::other("submission queue is full"))?;
+        }
+        let mut result = None;
+        let mut timer_result = None;
+        while result.is_none() || timer_result.is_none() {
+            match self.inner.submit_and_wait(1) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                // Returning would free memory the kernel may still reference.
+                Err(_) => std::process::abort(),
+            }
+            for cqe in self.inner.completion() {
+                match cqe.user_data() {
+                    1 => result = Some(cqe.result()),
+                    2 => timer_result = Some(cqe.result()),
+                    _ => std::process::abort(),
+                }
             }
         }
-        // Submit all pending SQEs without waiting for completions.
-        self.inner.submit()?;
-        let mut queue = self.inner.completion();
-        let cqe = queue.next().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "io_uring completion not yet available",
-            )
-        })?;
-        if cqe.result() < 0 {
-            return Err(std::io::Error::from_raw_os_error(-cqe.result()));
+        let result = result.unwrap();
+        if result == -libc::ECANCELED && timer_result == Some(-libc::ETIME) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "operation timed out",
+            ));
         }
-        Ok(cqe.result())
+        if result < 0 {
+            return Err(std::io::Error::from_raw_os_error(-result));
+        }
+        Ok(result)
     }
 
     pub fn wait_timeout(&mut self, timeout: std::time::Duration) -> std::io::Result<()> {
@@ -220,6 +240,7 @@ pub struct UdpEndpoint {
     fd: OwnedFd,
     pending: VecDeque<(SocketAddr, Vec<u8>)>,
     direct_io: bool,
+    receive_timeout: std::cell::Cell<std::time::Duration>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -302,6 +323,7 @@ impl UdpEndpoint {
             .unwrap_or(false);
         let direct_io = !use_io_uring;
         Ok(Self {
+            receive_timeout: std::cell::Cell::new(std::time::Duration::from_millis(100)),
             fd,
             pending: VecDeque::new(),
             direct_io,
@@ -344,6 +366,8 @@ impl UdpEndpoint {
     }
 
     pub fn set_receive_timeout(&self, timeout: std::time::Duration) -> std::io::Result<()> {
+        let timeout = timeout.max(std::time::Duration::from_micros(1));
+        self.receive_timeout.set(timeout);
         let value = libc::timeval {
             // `time_t` is i32 on musl (in the pinned libc) and i64 on glibc;
             // cap at i32::MAX and let inference pick the field type.
@@ -531,7 +555,7 @@ impl UdpEndpoint {
             insn(0x07, 9, 0, 0, 10),                      // r9 = UDP payload + 2
             insn(0x2d, 9, 8, 24, 0),                      // short header too small -> hash
             insn(0x71, 0, 7, 8, 0),                       // r0 = first QUIC byte
-            insn(0x45, 0, 0, 6, 0x80),                    // long header -> index 6
+            insn(0x45, 0, 0, 5, 0x80),                    // long header -> r9 initialization
             insn(0xbf, 9, 7, 0, 0),                       // r9 = UDP header
             insn(0x07, 9, 0, 0, 10),                      // r9 = UDP payload + 2
             insn(0x2d, 9, 8, 19, 0),                      // short header too small -> hash
@@ -623,6 +647,33 @@ impl UdpEndpoint {
         }))
     }
 
+    fn receive_message(
+        &self,
+        ring: &mut RuntimeRing,
+        message: &mut libc::msghdr,
+    ) -> std::io::Result<usize> {
+        let length = if self.direct_io {
+            let result = unsafe { libc::recvmsg(self.fd.as_raw_fd(), message, 0) };
+            if result < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            result as usize
+        } else {
+            let fd = ring.register_fd(self.fd.as_raw_fd())?;
+            let entry = io_uring::opcode::RecvMsg::new(fd, message)
+                .build()
+                .flags(io_uring::squeue::Flags::FIXED_FILE);
+            ring.submit_with_timeout(&entry, self.receive_timeout.get())? as usize
+        };
+        if message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "truncated UDP datagram",
+            ));
+        }
+        Ok(length)
+    }
+
     pub fn recv_from(
         &mut self,
         ring: &mut RuntimeRing,
@@ -652,34 +703,7 @@ impl UdpEndpoint {
         message.msg_control = control.as_mut_ptr().cast();
         // `msg_controllen` is `usize` on glibc and `socklen_t` on musl.
         message.msg_controllen = std::mem::size_of_val(&control) as _;
-        if self.direct_io {
-            // Bypass io_uring entirely when direct I/O is forced via SSXPRO_DIRECT_IO=1.
-            let result = unsafe { libc::recvmsg(self.fd.as_raw_fd(), &mut message, 0) };
-            if result < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            let length = result as usize;
-            let address = parse_socket_address(&peer)?;
-            return Ok((length, address));
-        }
-        let fd = ring.register_fd(self.fd.as_raw_fd())?;
-        let entry = io_uring::opcode::RecvMsg::new(fd, &mut message)
-            .build()
-            .flags(io_uring::squeue::Flags::FIXED_FILE)
-            .user_data(1);
-        let length = ring.submit_wait(&entry)? as usize;
-        if message.msg_flags & libc::MSG_CTRUNC != 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "UDP ancillary data was truncated",
-            ));
-        }
-        if message.msg_flags & libc::MSG_TRUNC != 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "UDP datagram exceeds receive buffer",
-            ));
-        }
+        let length = self.receive_message(ring, &mut message)?;
         let address = parse_socket_address(&peer)?;
         Ok((length, address))
     }
@@ -702,12 +726,7 @@ impl UdpEndpoint {
         message.msg_iovlen = 1;
         message.msg_control = control.as_mut_ptr().cast();
         message.msg_controllen = std::mem::size_of_val(&control) as _;
-        let fd = ring.register_fd(self.fd.as_raw_fd())?;
-        let entry = io_uring::opcode::RecvMsg::new(fd, &mut message)
-            .build()
-            .flags(io_uring::squeue::Flags::FIXED_FILE)
-            .user_data(3);
-        let length = ring.submit_wait(&entry)? as usize;
+        let length = self.receive_message(ring, &mut message)?;
         // SAFETY: recvmsg initialized the control buffer up to msg_controllen.
         let gro_segment_size = unsafe { find_udp_gro_size(&message) };
         Ok((
@@ -1286,13 +1305,16 @@ fn install_worker_seccomp(monitor_io: bool) -> std::io::Result<()> {
             libc::SYS_writev,
             libc::SYS_getrandom,
             libc::SYS_madvise,
+            #[cfg(target_arch = "x86_64")]
             libc::SYS_open,
             libc::SYS_openat,
             libc::SYS_openat2,
             libc::SYS_newfstatat,
             // musl's stat()/lstat() use the legacy syscalls; glibc resolves
             // through newfstatat/statx.
+            #[cfg(target_arch = "x86_64")]
             libc::SYS_stat,
+            #[cfg(target_arch = "x86_64")]
             libc::SYS_lstat,
             libc::SYS_fstat,
             libc::SYS_statx,
@@ -1302,7 +1324,9 @@ fn install_worker_seccomp(monitor_io: bool) -> std::io::Result<()> {
             libc::SYS_geteuid,
             libc::SYS_getgid,
             libc::SYS_getegid,
+            #[cfg(target_arch = "x86_64")]
             libc::SYS_access,
+            #[cfg(target_arch = "x86_64")]
             libc::SYS_readlink,
         ]);
     }
@@ -1642,8 +1666,6 @@ pub fn probe_kernel(options: &ProbeOptions) -> Vec<FeatureResult> {
 }
 
 pub fn probe_has_failures(results: &[FeatureResult], options: &ProbeOptions) -> bool {
-    // Check if kernel is 5.10+ to determine IOU_PBUF_RING_INC requirement
-    let require_pbuf_ring = false;
     let requested: Vec<&str> = [
         "io_uring setup flags",
         "IORING_OP_RECVMSG",
@@ -1660,8 +1682,6 @@ pub fn probe_has_failures(results: &[FeatureResult], options: &ProbeOptions) -> 
         if result.supported {
             return false;
         }
-        // On kernels < 5.10, IOU_PBUF_RING_INC is not required
-        let pbuf_required = require_pbuf_ring && result.name == "IOU_PBUF_RING_INC";
         requested.contains(&result.name)
             || (options.restrict_ring && result.name == "IORING_REGISTER_RESTRICTIONS")
             || result.name == "registered descriptors"
@@ -1672,7 +1692,7 @@ pub fn probe_has_failures(results: &[FeatureResult], options: &ProbeOptions) -> 
             || (options.sqpoll && result.name == "SQPOLL")
             || (options.napi_busy_poll_us > 0 && result.name == "IORING_REGISTER_NAPI")
             || (options.txtime_pacing && result.name == "SO_TXTIME")
-            || pbuf_required
+            || (options.reuseport_steering && result.name == "sk_reuseport eBPF CID selector")
     })
 }
 
@@ -2062,47 +2082,30 @@ fn skip(name: &'static str, detail: impl Into<String>) -> FeatureResult {
 /// Parse the kernel release string and return (major, minor, patch).
 /// Uses `uname -r` if available, otherwise falls back to parsing /proc/version.
 pub fn kernel_release() -> (u16, u16, u16) {
-    // Try `uname -r` first
-    if let Ok(output) = std::process::Command::new("uname").args(["-r"]).output() {
-        if let Ok(release) = String::from_utf8(output.stdout) {
-            let release = release.trim();
-            // Parse major.minor.patch
-            if let Some((major_str, rest)) = release.split_once('.') {
-                if let Some((minor_str, _)) = rest.split_once('.') {
-                    if let (Ok(major), Ok(minor)) =
-                        (major_str.parse::<u16>(), minor_str.parse::<u16>())
-                    {
-                        // Try to get patch version from the remaining string
-                        if let Some(patch_str) = rest.split('.').next() {
-                            if let Ok(patch) = patch_str.parse::<u16>() {
-                                return (major, minor, patch);
-                            }
-                        }
-                        return (major, minor, 0);
-                    }
-                }
-            }
-        }
+    let mut info: libc::utsname = unsafe { zeroed() };
+    // SAFETY: uname writes into a correctly sized, initialized utsname.
+    if unsafe { libc::uname(&mut info) } != 0 {
+        return (0, 0, 0);
     }
+    // SAFETY: uname returns a NUL-terminated release field.
+    let release = unsafe { std::ffi::CStr::from_ptr(info.release.as_ptr()) };
+    let Ok(release) = release.to_str() else {
+        return (0, 0, 0);
+    };
+    parse_kernel_release(release).unwrap_or((0, 0, 0))
+}
 
-    // Fall back to /proc/version
-    if let Ok(content) = std::fs::read_to_string("/proc/version") {
-        let release = content.trim();
-        // Parse "5.15.0-91-generic" -> (5, 15, 0)
-        if let Some((_major_str, rest)) = release.split_once(' ') {
-            if let Some((major_str, rest)) = rest.split_once('.') {
-                if let Some((minor_str, _)) = rest.split_once('.') {
-                    if let (Ok(major), Ok(minor)) =
-                        (major_str.parse::<u16>(), minor_str.parse::<u16>())
-                    {
-                        return (major, minor, 0);
-                    }
-                }
-            }
-        }
-    }
-
-    (0, 0, 0)
+fn parse_kernel_release(release: &str) -> Option<(u16, u16, u16)> {
+    let mut parts = release.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts
+        .next()?
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()?;
+    Some((major, minor, patch))
 }
 
 /// Check if the kernel version is at least 5.10
@@ -2128,6 +2131,64 @@ mod tests {
     use super::{
         probe_has_failures, FeatureResult, ProbeHeader, ProbeOp, ProbeOptions, Restriction,
     };
+
+    #[test]
+    #[ignore = "requires host io_uring support"]
+    fn receive_timeout_drains_completions_and_rejects_truncation() {
+        let mut ring = super::RuntimeRing::new(16, true, [1, 1]).unwrap();
+        let mut endpoint = super::UdpEndpoint::bind("127.0.0.1:0".parse().unwrap(), false).unwrap();
+        endpoint
+            .set_receive_timeout(std::time::Duration::from_millis(10))
+            .unwrap();
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let address = endpoint.local_addr().unwrap();
+        for direct in [false, true] {
+            endpoint.direct_io = direct;
+            let mut buffer = [0u8; 8];
+            let started = std::time::Instant::now();
+            let error = endpoint.recv_from(&mut ring, &mut buffer).unwrap_err();
+            assert!(matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ));
+            assert!(started.elapsed() < std::time::Duration::from_secs(1));
+            sender.send_to(b"ok", address).unwrap();
+            assert_eq!(endpoint.recv_from(&mut ring, &mut buffer).unwrap().0, 2);
+            sender.send_to(&[1; 32], address).unwrap();
+            assert_eq!(
+                endpoint
+                    .recv_from(&mut ring, &mut buffer)
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::InvalidData
+            );
+            sender.send_to(&[1; 32], address).unwrap();
+            assert_eq!(
+                endpoint
+                    .recv_gro(&mut ring, &mut buffer)
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::InvalidData
+            );
+            let error = endpoint.recv_gro(&mut ring, &mut buffer).unwrap_err();
+            assert!(matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ));
+        }
+    }
+
+    #[test]
+    fn release_parser_handles_suffix_and_malformed_values() {
+        assert_eq!(
+            super::parse_kernel_release("6.12.34-custom"),
+            Some((6, 12, 34))
+        );
+        assert_eq!(super::parse_kernel_release("6.12.0"), Some((6, 12, 0)));
+        for invalid in ["", "6", "6.12", "6.12.x", "x.12.0"] {
+            assert_eq!(super::parse_kernel_release(invalid), None);
+        }
+    }
 
     #[test]
     fn io_uring_probe_and_restriction_uapi_layouts_match_linux() {

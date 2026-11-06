@@ -52,6 +52,7 @@ pub struct TlsIdentity {
 #[derive(Clone)]
 pub struct IpcSigner {
     stream: Arc<Mutex<UnixStream>>,
+    auth_stream: Arc<Mutex<UnixStream>>,
 }
 
 pub struct AuthorizedLogin {
@@ -60,9 +61,10 @@ pub struct AuthorizedLogin {
 }
 
 impl IpcSigner {
-    pub fn new(stream: UnixStream) -> Self {
+    pub fn new(stream: UnixStream, auth_stream: UnixStream) -> Self {
         Self {
             stream: Arc::new(Mutex::new(stream)),
+            auth_stream: Arc::new(Mutex::new(auth_stream)),
         }
     }
 
@@ -76,7 +78,7 @@ impl IpcSigner {
         signature: &[u8; 64],
     ) -> io::Result<Option<AuthorizedLogin>> {
         let stream = self
-            .stream
+            .auth_stream
             .lock()
             .map_err(|_| io::Error::other("monitor IPC lock poisoned"))?;
         let mut request = [0u8; MAX_MONITOR_AUTH_FRAME];
@@ -283,6 +285,7 @@ pub fn server_config_with_signer(
 /// identity is sent once; all subsequent messages are bounded and validated.
 pub fn serve_signing_requests(
     stream: UnixStream,
+    auth_stream: UnixStream,
     mut seed: Zeroizing<[u8; 32]>,
     allow_root: bool,
     server_authorized_keys: PathBuf,
@@ -319,6 +322,87 @@ pub fn serve_signing_requests(
         server_authorized_keys,
         authorized_keys_name.clone(),
     )?;
+    let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("ssxd-monitor-auth".to_owned())
+        .spawn(move || {
+            // Set no_new_privs before the monitor applies its TSYNC filter.
+            let ready = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } == 0;
+            let _ = ready_sender.send(ready);
+            if !ready {
+                return;
+            }
+            let stream = auth_stream;
+            let _ = (|| -> Result<(), Box<dyn std::error::Error>> {
+                loop {
+                    let mut first = [0u8; 1];
+                    read_exact_fd(stream.as_raw_fd(), &mut first)?;
+                    if first[0] != 2 {
+                        return Err("invalid auth request".into());
+                    }
+
+                    let mut frame = [0u8; MAX_MONITOR_AUTH_FRAME];
+                    frame[0] = 2;
+                    read_exact_fd(stream.as_raw_fd(), &mut frame[1..3])?;
+                    let user_len = usize::from(u16::from_be_bytes([frame[1], frame[2]]));
+                    if user_len == 0 || user_len > ssxpro_proto::MAX_MONITOR_USER {
+                        return Err("invalid authentication IPC frame".into());
+                    }
+                    let frame_len = 3 + user_len + 32 * 4 + 64;
+                    read_exact_fd(stream.as_raw_fd(), &mut frame[3..frame_len])?;
+                    let request = decode_monitor_request(&frame[..frame_len])
+                        .map_err(|_| "invalid authentication IPC frame")?;
+                    let MonitorRequest::Authenticate {
+                        user,
+                        public_key,
+                        server_nonce,
+                        client_nonce,
+                        spki_hash,
+                        signature,
+                    } = request
+                    else {
+                        return Err("invalid authentication IPC type".into());
+                    };
+                    let (response_sender, response_receiver) = mpsc::sync_channel(1);
+                    let check = AuthCheckJob {
+                        request: AuthCheck {
+                            user: user.to_owned(),
+                            public_key,
+                            server_nonce,
+                            client_nonce,
+                            spki_hash,
+                            signature,
+                        },
+                        response: response_sender,
+                    };
+                    let identity = match auth_sender.try_send(check) {
+                        Ok(()) => response_receiver
+                            .recv_timeout(AUTH_CHECK_TIMEOUT)
+                            .unwrap_or(None),
+                        Err(_) => None,
+                    };
+                    if let Some(identity) = identity {
+                        let token = match crate::ipc::mint_session_token(&token_secret, &identity) {
+                            Ok(token) => token,
+                            Err(_) => {
+                                write_all_fd(stream.as_raw_fd(), &[1])?;
+                                continue;
+                            }
+                        };
+                        if write_login_identity(stream.as_raw_fd(), &identity).is_err() {
+                            write_all_fd(stream.as_raw_fd(), &[1])?;
+                        } else {
+                            write_session_token(stream.as_raw_fd(), &token)?;
+                        }
+                    } else {
+                        write_all_fd(stream.as_raw_fd(), &[1])?;
+                    }
+                }
+            })();
+        })?;
+    if !ready_receiver.recv().unwrap_or(false) {
+        return Err("could not restrict authorization thread".into());
+    }
     ssxpro_io::sandbox_tls_monitor()?;
     loop {
         let mut first = [0u8; 1];
@@ -350,64 +434,6 @@ pub fn serve_signing_requests(
                         write_all_fd(stream.as_raw_fd(), &signature)?;
                     }
                     Err(_) => write_all_fd(stream.as_raw_fd(), &[1, 0, 0])?,
-                }
-            }
-            2 => {
-                let mut frame = [0u8; MAX_MONITOR_AUTH_FRAME];
-                frame[0] = 2;
-                read_exact_fd(stream.as_raw_fd(), &mut frame[1..3])?;
-                let user_len = usize::from(u16::from_be_bytes([frame[1], frame[2]]));
-                if user_len == 0 || user_len > ssxpro_proto::MAX_MONITOR_USER {
-                    return Err("invalid authentication IPC frame".into());
-                }
-                let frame_len = 3 + user_len + 32 * 4 + 64;
-                read_exact_fd(stream.as_raw_fd(), &mut frame[3..frame_len])?;
-                let request = decode_monitor_request(&frame[..frame_len])
-                    .map_err(|_| "invalid authentication IPC frame")?;
-                let MonitorRequest::Authenticate {
-                    user,
-                    public_key,
-                    server_nonce,
-                    client_nonce,
-                    spki_hash,
-                    signature,
-                } = request
-                else {
-                    return Err("invalid authentication IPC type".into());
-                };
-                let (response_sender, response_receiver) = mpsc::sync_channel(1);
-                let check = AuthCheckJob {
-                    request: AuthCheck {
-                        user: user.to_owned(),
-                        public_key,
-                        server_nonce,
-                        client_nonce,
-                        spki_hash,
-                        signature,
-                    },
-                    response: response_sender,
-                };
-                let identity = match auth_sender.try_send(check) {
-                    Ok(()) => response_receiver
-                        .recv_timeout(AUTH_CHECK_TIMEOUT)
-                        .unwrap_or(None),
-                    Err(_) => None,
-                };
-                if let Some(identity) = identity {
-                    let token = match crate::ipc::mint_session_token(&token_secret, &identity) {
-                        Ok(token) => token,
-                        Err(_) => {
-                            write_all_fd(stream.as_raw_fd(), &[1])?;
-                            continue;
-                        }
-                    };
-                    if write_login_identity(stream.as_raw_fd(), &identity).is_err() {
-                        write_all_fd(stream.as_raw_fd(), &[1])?;
-                    } else {
-                        write_session_token(stream.as_raw_fd(), &token)?;
-                    }
-                } else {
-                    write_all_fd(stream.as_raw_fd(), &[1])?;
                 }
             }
             _ => return Err("unknown monitor IPC request".into()),
@@ -658,6 +684,15 @@ fn write_all_fd(fd: libc::c_int, mut buffer: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pending_authorization_does_not_lock_signing_channel() {
+        let (signing, _signing_peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (auth, _auth_peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let signer = super::IpcSigner::new(signing, auth);
+        let _pending_authorization = signer.auth_stream.lock().unwrap();
+        assert!(signer.stream.try_lock().is_ok());
+    }
+
     #[test]
     fn makes_a_certificate_from_the_host_seed() {
         let identity = identity_from_seed([7; 32]).unwrap();

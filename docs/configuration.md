@@ -1,3 +1,7 @@
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:b502c95b7bbbe5b2dc479b00d336100bc6a2eba03502a7108acc0f79320a1304 -->
+
 # Configuration
 
 Both programs deserialize YAML into strict, typed structures. Unknown keys and wrong types are errors; all omitted keys receive the defaults shown below. Range and cross-field errors identify the YAML key and line. Parser errors include the YAML parser's line and column.
@@ -7,7 +11,7 @@ Both programs deserialize YAML into strict, typed structures. Unknown keys and w
 ```yaml
 listen: "0.0.0.0:22"
 host_key: /etc/ssx/host_ed25519
-workers: 1
+workers: 1 # Example; omitted workers defaults to the number of available CPUs
 io:
   ring_entries: 4096
   recv_buffers: 2048
@@ -96,3 +100,6 @@ Public keys are checked in two places, in order:
 2. `~USER/.ssx/<auth.authorized_keys>` (default `authorized_keys`): the per-user file, read only when the server-wide list did not match. Home, `.ssx`, and key-file ownership and modes are checked before reading.
 
 Each non-comment line in either file is `ed25519 BASE64_KEY [comment]`; any option or unknown token rejects the line.
+
+
+<!-- /coderabbit-ai-generated:v1 -->

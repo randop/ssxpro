@@ -48,6 +48,8 @@ struct PeerSession {
     decoder: FrameDecoder,
     server_nonce: Option<[u8; 32]>,
     authenticated: bool,
+    send_failed: bool,
+    pending_auth: Option<Receiver<std::io::Result<Option<crate::tls::AuthorizedLogin>>>>,
     identity: Option<crate::session::LoginIdentity>,
     session_token: Option<Vec<u8>>,
     session_request_id: Option<u32>,
@@ -56,6 +58,7 @@ struct PeerSession {
     stream4_opened: bool,
     pty_pending: VecDeque<Vec<u8>>,
     pty_pending_bytes: usize,
+    pty_input: VecDeque<u8>,
     pty_fin: bool,
     exit_observed_at: Option<Instant>,
     max_rows: u16,
@@ -395,6 +398,7 @@ fn start_tls_monitor(
     let mut seed =
         Zeroizing::new(crate::read_host_key_seed(&config.host_key).map_err(std::io::Error::other)?);
     let (mut worker_stream, monitor_stream) = UnixStream::pair()?;
+    let (worker_auth, monitor_auth) = UnixStream::pair()?;
     // SAFETY: ssxd starts this monitor before creating worker threads, so fork
     // cannot inherit locked Rust or BoringSSL runtime state.
     let parent_pid = unsafe { libc::getpid() };
@@ -405,6 +409,7 @@ fn start_tls_monitor(
     }
     if pid == 0 {
         drop(worker_stream);
+        drop(worker_auth);
         // SAFETY: scalar prctl arguments; the parent check closes the race before
         // the monitor blocks on its signing socket.
         let setup_ok = unsafe {
@@ -417,6 +422,7 @@ fn start_tls_monitor(
         }
         let result = crate::tls::serve_signing_requests(
             monitor_stream,
+            monitor_auth,
             seed,
             config.auth.allow_root,
             config.auth.server_authorized_keys.clone(),
@@ -428,6 +434,7 @@ fn start_tls_monitor(
     }
     token_secret.zeroize();
     drop(monitor_stream);
+    drop(monitor_auth);
     seed.zeroize();
     let control = match worker_stream.try_clone() {
         Ok(control) => control,
@@ -448,7 +455,11 @@ fn start_tls_monitor(
             return Err(error);
         }
     };
-    Ok((identity, crate::tls::IpcSigner::new(worker_stream), monitor))
+    Ok((
+        identity,
+        crate::tls::IpcSigner::new(worker_stream, worker_auth),
+        monitor,
+    ))
 }
 
 fn serve_worker(
@@ -497,6 +508,23 @@ fn serve_worker(
         tls_signer.clone(),
         u64::from(config.quic.idle_timeout_secs) * 1000,
     )?;
+    let (auth_sender, auth_receiver) = mpsc::sync_channel::<AuthJob>(8);
+    let authorizer = tls_signer.clone();
+    std::thread::Builder::new()
+        .name("ssxd-authorize".to_owned())
+        .spawn(move || {
+            while let Ok(job) = auth_receiver.recv() {
+                let result = authorizer.authorize(
+                    &job.user,
+                    &job.public_key,
+                    &job.server_nonce,
+                    &job.client_nonce,
+                    &job.spki_hash,
+                    &job.signature,
+                );
+                let _ = job.response.send(result);
+            }
+        })?;
     let spki_hash = sha256(&spki_der)?;
     let local = endpoint.local_addr()?;
     let mut sessions: HashMap<Vec<u8>, PeerSession> = HashMap::new();
@@ -515,6 +543,12 @@ fn serve_worker(
     // configured interval. 0 disables it.
     let keep_alive_interval = Duration::from_secs(u64::from(config.quic.keep_alive_interval_secs));
     loop {
+        for peer in sessions.values_mut() {
+            if let Err(error) = complete_authorization(peer, &auth_failure_limiter) {
+                eprintln!("ssxd: authorization failed: {error}");
+                let _ = peer.conn.close(true, 2, b"authentication failed");
+            }
+        }
         poll_broker(
             &session_channel,
             &mut ring,
@@ -554,6 +588,25 @@ fn serve_worker(
             }
             break;
         }
+        // A bounded batch of one datagram prevents busy peers starving timers.
+        maintain_sessions(
+            &mut sessions,
+            &mut connection_ids,
+            &mut pending_sessions,
+            &mut ring,
+            &endpoint,
+            &mut output,
+            &session_channel,
+            keep_alive_interval,
+            verbose,
+        )?;
+        let receive_timeout = sessions
+            .values()
+            .filter_map(|peer| peer.conn.timeout())
+            .min()
+            .unwrap_or(Duration::from_millis(100))
+            .min(Duration::from_millis(100));
+        endpoint.set_receive_timeout(receive_timeout)?;
         match endpoint.recv_from(&mut ring, &mut packet) {
             Ok((length, peer)) => {
                 debug3!(
@@ -609,7 +662,13 @@ fn serve_worker(
                                 &mut output,
                             )?;
                             drop(header);
-                            endpoint.send_to(&mut ring, &output[..retry_length], peer)?;
+                            if let Err(error) =
+                                endpoint.send_to(&mut ring, &output[..retry_length], peer)
+                            {
+                                if !peer_send_error(&error) {
+                                    return Err(error.into());
+                                }
+                            }
                             continue;
                         }
                         if validate_retry_token(&retry_secret, &peer, token).is_none() {
@@ -668,6 +727,8 @@ fn serve_worker(
                             decoder: FrameDecoder::new(),
                             server_nonce: None,
                             authenticated: false,
+                            pending_auth: None,
+                            send_failed: false,
                             identity: None,
                             session_token: None,
                             session_request_id: None,
@@ -676,6 +737,7 @@ fn serve_worker(
                             pty_output: None,
                             pty_pending: VecDeque::new(),
                             pty_pending_bytes: 0,
+                            pty_input: VecDeque::new(),
                             pty_fin: false,
                             exit_observed_at: None,
                             max_rows: config.session.max_rows,
@@ -720,19 +782,7 @@ fn serve_worker(
                 // A datagram from the peer is activity; QUIC keepalives are
                 // only sent while a session is completely quiet.
                 peer_session.last_activity_at = Instant::now();
-                // For newly accepted connections, attempt an initial flush before
-                // processing the packet. quiche may need to generate its first
-                // flight before processing the client's ClientHello can advance
-                // the handshake state further.
-                if is_new_connection {
-                    let _ = flush_quic(peer_session, &endpoint, &mut ring, &mut output, verbose);
-                }
-                // For newly accepted connections, quiche::accept() already
-                // consumed this Initial packet. Calling conn.recv() with the
-                // same packet data returns TlsFail (expected), but it lets
-                // quiche finalize its handshake state so conn.send() can
-                // generate the server's first flight. For existing
-                // connections, process the received packet normally.
+                // Feed each received datagram to QUIC exactly once.
                 match peer_session.conn.recv(
                     &mut packet[..length],
                     quiche::RecvInfo {
@@ -746,25 +796,9 @@ fn serve_worker(
                         peer_session.conn.is_established()
                     ),
                     Err(e) if is_new_connection => {
-                        // accept() already consumed this packet; TlsFail is expected.
                         debug3!(verbose, "server recv after accept (expected): {e}");
                     }
                     Err(e) => debug3!(verbose, "server recv error: {e}"),
-                }
-                peer_session.conn.on_timeout();
-                // Poll conn.recv() with empty buffers to let quiche finalize
-                // its handshake state after accept()+recv(), so conn.send() can
-                // generate the server's first flight (ServerHello + Finished).
-                for _ in 0..3 {
-                    let mut extra = [0u8; 1];
-                    let _ = peer_session.conn.recv(
-                        &mut extra,
-                        quiche::RecvInfo {
-                            from: peer,
-                            to: local,
-                        },
-                    );
-                    peer_session.conn.on_timeout();
                 }
                 let peer_work = (|| -> Result<(), Box<dyn std::error::Error>> {
                     if peer_session.conn.is_established() {
@@ -773,7 +807,7 @@ fn serve_worker(
                             &spki_hash,
                             active_sessions,
                             session_limit,
-                            &tls_signer,
+                            &auth_sender,
                             &auth_failure_limiter,
                             &connection_key,
                             &session_channel,
@@ -793,29 +827,7 @@ fn serve_worker(
                         .close(true, 1, b"protocol or session error");
                 }
                 flush_quic(peer_session, &endpoint, &mut ring, &mut output, verbose)?;
-                // Second pass: re-process the packet data with conn.recv() to
-                // advance quiche's handshake state, then flush again to
-                // generate the server's Finished after the ServerHello.
-                match peer_session.conn.recv(
-                    &mut packet[..length],
-                    quiche::RecvInfo {
-                        from: peer,
-                        to: local,
-                    },
-                ) {
-                    Ok(n) => debug3!(
-                        verbose,
-                        "server recv pass2 processed {n} bytes, established={}",
-                        peer_session.conn.is_established()
-                    ),
-                    Err(e) if is_new_connection => {
-                        debug3!(verbose, "server recv pass2 (expected): {e}");
-                    }
-                    Err(e) => debug3!(verbose, "server recv pass2 error: {e}"),
-                }
-                peer_session.conn.on_timeout();
-                flush_quic(peer_session, &endpoint, &mut ring, &mut output, verbose)?;
-                if peer_session.conn.is_closed() {
+                if peer_session.conn.is_closed() || peer_session.send_failed {
                     close_peer_session(
                         peer_session,
                         &mut ring,
@@ -835,64 +847,6 @@ fn serve_worker(
                     || error.kind() == std::io::ErrorKind::TimedOut =>
             {
                 debug3!(verbose, "server recv_from WouldBlock/TimedOut");
-                let mut closed = Vec::new();
-                for (connection_key, peer_session) in &mut sessions {
-                    let now = std::time::Instant::now();
-                    let expired = match peer_session.state {
-                        ServerState::Start => {
-                            now.duration_since(peer_session.created_at) >= peer_session.hello_grace
-                        }
-                        ServerState::AwaitAuth => peer_session
-                            .hello_at
-                            .is_some_and(|at| now.duration_since(at) >= peer_session.auth_timeout),
-                        ServerState::AwaitOpen => peer_session.hello_at.is_some_and(|at| {
-                            now.duration_since(at)
-                                >= peer_session.login_grace + peer_session.auth_timeout
-                        }),
-                        ServerState::Running | ServerState::Closed => false,
-                    };
-                    if expired {
-                        let _ = peer_session.conn.close(true, 3, b"login timeout");
-                    }
-                    if peer_session
-                        .conn
-                        .timeout()
-                        .is_some_and(|timeout| timeout.is_zero())
-                    {
-                        peer_session.conn.on_timeout();
-                    }
-                    if !keep_alive_interval.is_zero()
-                        && peer_session.conn.is_established()
-                        && !peer_session.conn.is_closed()
-                        && peer_session.last_activity_at.elapsed() >= keep_alive_interval
-                    {
-                        let _ = peer_session.conn.send_ack_eliciting();
-                        peer_session.last_activity_at = now;
-                    }
-                    if let Err(error) = pump_pty(peer_session) {
-                        eprintln!("ssxd: closing failed PTY session: {error}");
-                        let _ = peer_session.conn.close(true, 2, b"session failure");
-                    }
-                    flush_quic(peer_session, &endpoint, &mut ring, &mut output, verbose)?;
-                    if peer_session.conn.is_closed() {
-                        close_peer_session(
-                            peer_session,
-                            &mut ring,
-                            &session_channel,
-                            &mut pending_sessions,
-                        );
-                        closed.push(connection_key.clone());
-                    } else {
-                        for source_id in peer_session.conn.source_ids() {
-                            connection_ids
-                                .insert(source_id.as_ref().to_vec(), connection_key.clone());
-                        }
-                    }
-                }
-                for connection_key in closed {
-                    sessions.remove(&connection_key);
-                    connection_ids.retain(|_, owner| owner != &connection_key);
-                }
             }
             Err(error)
                 if error.kind() == std::io::ErrorKind::Interrupted
@@ -905,6 +859,72 @@ fn serve_worker(
     }
     stop.store(true, Ordering::Release);
     eprintln!("ssxd: worker {worker_id} stopping");
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maintain_sessions(
+    sessions: &mut HashMap<Vec<u8>, PeerSession>,
+    connection_ids: &mut HashMap<Vec<u8>, Vec<u8>>,
+    pending_sessions: &mut HashMap<u32, Vec<u8>>,
+    ring: &mut RuntimeRing,
+    endpoint: &UdpEndpoint,
+    output: &mut [u8],
+    session_channel: &crate::ipc::SessionChannel,
+    keep_alive_interval: Duration,
+    verbose: u8,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut closed = Vec::new();
+    for (connection_key, peer_session) in sessions.iter_mut() {
+        let now = std::time::Instant::now();
+        let expired = match peer_session.state {
+            ServerState::Start => {
+                now.duration_since(peer_session.created_at) >= peer_session.hello_grace
+            }
+            ServerState::AwaitAuth | ServerState::AuthPending => peer_session
+                .hello_at
+                .is_some_and(|at| now.duration_since(at) >= peer_session.auth_timeout),
+            ServerState::AwaitOpen => peer_session.hello_at.is_some_and(|at| {
+                now.duration_since(at) >= peer_session.login_grace + peer_session.auth_timeout
+            }),
+            ServerState::Running | ServerState::Closed => false,
+        };
+        if expired {
+            let _ = peer_session.conn.close(true, 3, b"login timeout");
+        }
+        if peer_session
+            .conn
+            .timeout()
+            .is_some_and(|timeout| timeout.is_zero())
+        {
+            peer_session.conn.on_timeout();
+        }
+        if !keep_alive_interval.is_zero()
+            && peer_session.conn.is_established()
+            && !peer_session.conn.is_closed()
+            && peer_session.last_activity_at.elapsed() >= keep_alive_interval
+        {
+            let _ = peer_session.conn.send_ack_eliciting();
+            peer_session.last_activity_at = now;
+        }
+        if let Err(error) = process_data(peer_session, ring).and_then(|_| pump_pty(peer_session)) {
+            eprintln!("ssxd: closing failed PTY session: {error}");
+            let _ = peer_session.conn.close(true, 2, b"session failure");
+        }
+        flush_quic(peer_session, endpoint, ring, output, verbose)?;
+        if peer_session.conn.is_closed() || peer_session.send_failed {
+            close_peer_session(peer_session, ring, session_channel, pending_sessions);
+            closed.push(connection_key.clone());
+        } else {
+            for source_id in peer_session.conn.source_ids() {
+                connection_ids.insert(source_id.as_ref().to_vec(), connection_key.clone());
+            }
+        }
+    }
+    for connection_key in closed {
+        sessions.remove(&connection_key);
+        connection_ids.retain(|_, owner| owner != &connection_key);
+    }
     Ok(())
 }
 
@@ -1033,7 +1053,7 @@ fn process_control(
     spki_hash: &[u8; 32],
     active_sessions: usize,
     session_limit: usize,
-    monitor: &crate::tls::IpcSigner,
+    auth_sender: &mpsc::SyncSender<AuthJob>,
     auth_failures: &Mutex<AuthFailureLimiter>,
     connection_key: &[u8],
     session_channel: &crate::ipc::SessionChannel,
@@ -1100,42 +1120,19 @@ fn process_control(
                         .server_nonce
                         .take()
                         .ok_or("missing or replayed server challenge")?;
-                    let Some(login) = monitor.authorize(
-                        name,
-                        &public_key,
-                        &nonce,
-                        &client_nonce,
-                        spki_hash,
-                        &signature,
-                    )?
-                    else {
-                        debug1!(
-                            verbose,
-                            "authentication rejected for user={name} from {} (session {})",
-                            peer.peer_ip,
-                            short_hex(connection_key)
-                        );
-                        auth_failures
-                            .lock()
-                            .map_err(|_| "auth failure limiter lock poisoned")?
-                            .record_failure(peer.peer_ip);
-                        return Err("login authorization rejected".into());
-                    };
-                    debug1!(
-                        verbose,
-                        "authentication succeeded for user={name} from {} (session {})",
-                        peer.peer_ip,
-                        short_hex(connection_key)
-                    );
-                    // Account policy, key trust and the signature are decided
-                    // by the monitor; this identity and its one-time token are
-                    // the monitor's result.
-                    peer.authenticated = true;
-                    peer.identity = Some(login.identity);
-                    peer.session_token = Some(login.token);
-                    let response = Message::AuthOk;
-                    send_control(&mut peer.conn, &response)?;
-                    peer.state.sent(&response)?;
+                    let (sender, receiver) = mpsc::sync_channel(1);
+                    auth_sender
+                        .try_send(AuthJob {
+                            user: name.to_owned(),
+                            public_key,
+                            server_nonce: nonce,
+                            client_nonce,
+                            spki_hash: *spki_hash,
+                            signature,
+                            response: sender,
+                        })
+                        .map_err(|_| "authorization queue is full")?;
+                    peer.pending_auth = Some(receiver);
                 }
                 Message::OpenShell {
                     term,
@@ -1187,6 +1184,9 @@ fn process_control(
                     pending_sessions.insert(request_id, connection_key.to_vec());
                 }
                 Message::Resize { rows, cols } if peer.authenticated => {
+                    if rows > peer.max_rows || cols > peer.max_columns {
+                        return Err("requested terminal dimensions exceed server policy".into());
+                    }
                     if let Some(session) = &peer.pty {
                         session.resize(rows, cols)?;
                     }
@@ -1372,17 +1372,30 @@ fn close_peer_session(
 
 fn process_data(
     peer: &mut PeerSession,
-    ring: &mut RuntimeRing,
+    _ring: &mut RuntimeRing,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !peer.authenticated || peer.state != ServerState::Running || peer.pty.is_none() {
         return Ok(());
     }
+    drain_pty_input(peer)?;
     let mut input = [0u8; 16 * 1024];
     for stream in peer.conn.readable().collect::<Vec<_>>() {
         if stream != 4 {
             continue;
         }
-        while let Ok((length, fin)) = peer.conn.stream_recv(stream, &mut input) {
+        loop {
+            // Reserve one byte for the terminal EOF character on FIN.
+            let capacity = (256 * 1024usize)
+                .saturating_sub(peer.pty_input.len() + 1)
+                .min(input.len());
+            if capacity == 0 {
+                break;
+            }
+            let (length, fin) = match peer.conn.stream_recv(stream, &mut input[..capacity]) {
+                Ok(value) => value,
+                Err(quiche::Error::Done) => break,
+                Err(error) => return Err(error.into()),
+            };
             if length == 0 && !fin {
                 break;
             }
@@ -1400,18 +1413,25 @@ fn process_data(
                 data = rest;
             }
             if !data.is_empty() {
-                write_pty(ring, peer.pty.as_ref().unwrap().master_fd(), data)?;
+                peer.pty_input.extend(data);
             }
             if fin {
-                write_pty(ring, peer.pty.as_ref().unwrap().master_fd(), &[0x04])?;
+                peer.pty_input.push_back(0x04);
+                drain_pty_input(peer)?;
                 break;
             }
+            drain_pty_input(peer)?;
         }
     }
     Ok(())
 }
 
 fn pty_reader(master_fd: RawFd) -> Result<PtyReader, Box<dyn std::error::Error>> {
+    let mut nonblocking: libc::c_int = 1;
+    // SAFETY: the PTY is open and the ioctl takes a pointer to an int.
+    if unsafe { libc::ioctl(master_fd, libc::FIONBIO, &mut nonblocking) } < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
     // SAFETY: fcntl duplicates an open PTY master into a new owned descriptor.
     let duplicate = unsafe { libc::fcntl(master_fd, libc::F_DUPFD_CLOEXEC, 0) };
     if duplicate < 0 {
@@ -1460,22 +1480,35 @@ fn pty_reader(master_fd: RawFd) -> Result<PtyReader, Box<dyn std::error::Error>>
     Ok((receiver, worker))
 }
 
-fn write_pty(
-    ring: &mut RuntimeRing,
+fn drain_pty_input(peer: &mut PeerSession) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(pty) = &peer.pty else {
+        return Ok(());
+    };
+    drain_pty_queue(pty.master_fd(), &mut peer.pty_input)
+}
+
+fn drain_pty_queue(
     fd: RawFd,
-    mut bytes: &[u8],
+    pending: &mut VecDeque<u8>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    while !bytes.is_empty() {
-        let fixed_fd = ring.register_fd(fd)?;
-        let entry = io_uring::opcode::Write::new(fixed_fd, bytes.as_ptr(), bytes.len() as _)
-            .build()
-            .flags(io_uring::squeue::Flags::FIXED_FILE)
-            .user_data(2);
-        let written = ring.submit_wait(&entry)? as usize;
+    while !pending.is_empty() {
+        let (bytes, _) = pending.as_slices();
+        // SAFETY: the descriptor is nonblocking and bytes remains live for the write.
+        let written = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+        if written < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                break;
+            }
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error.into());
+        }
         if written == 0 {
             return Err("PTY write returned zero bytes".into());
         }
-        bytes = &bytes[written..];
+        pending.drain(..written as usize);
     }
     Ok(())
 }
@@ -1634,7 +1667,9 @@ fn flush_quic(
     verbose: u8,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
-        peer.conn.on_timeout();
+        if peer.conn.timeout().is_some_and(|timeout| timeout.is_zero()) {
+            peer.conn.on_timeout();
+        }
         match peer.conn.send(output) {
             Ok((length, info)) => {
                 debug2!(
@@ -1643,7 +1678,14 @@ fn flush_quic(
                     length,
                     info.to
                 );
-                endpoint.send_to(ring, &output[..length], info.to)?;
+                if let Err(error) = endpoint.send_to(ring, &output[..length], info.to) {
+                    if !peer_send_error(&error) {
+                        return Err(error.into());
+                    }
+                    peer.send_failed = true;
+                    let _ = peer.conn.close(false, 0, b"peer routing failure");
+                    return Ok(());
+                }
             }
             Err(quiche::Error::Done) => {
                 debug2!(
@@ -1663,6 +1705,57 @@ fn flush_quic(
 mod tests {
     use super::{mint_retry_token, validate_retry_token};
     use std::net::SocketAddr;
+
+    #[test]
+    fn pty_backpressure_retains_every_byte() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let (mut master, mut slave) = (-1, -1);
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        let master = unsafe { OwnedFd::from_raw_fd(master) };
+        let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+        let mut term = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut term) }, 0);
+        unsafe {
+            libc::cfmakeraw(&mut term);
+        }
+        assert_eq!(
+            unsafe { libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, &term) },
+            0
+        );
+        for fd in [master.as_raw_fd(), slave.as_raw_fd()] {
+            let mut enabled = 1;
+            assert_eq!(unsafe { libc::ioctl(fd, libc::FIONBIO, &mut enabled) }, 0);
+        }
+        let expected: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+        let mut pending = expected.iter().copied().collect();
+        super::drain_pty_queue(master.as_raw_fd(), &mut pending).unwrap();
+        assert!(!pending.is_empty());
+        let mut received = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while received.len() < expected.len() && std::time::Instant::now() < deadline {
+            let mut buffer = [0u8; 4096];
+            let n =
+                unsafe { libc::read(slave.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
+            if n > 0 {
+                received.extend_from_slice(&buffer[..n as usize]);
+            }
+            super::drain_pty_queue(master.as_raw_fd(), &mut pending).unwrap();
+            std::thread::yield_now();
+        }
+        assert!(pending.is_empty());
+        assert_eq!(received, expected);
+    }
 
     #[test]
     fn retry_token_binds_address_port_cid_and_mac() {
@@ -1697,4 +1790,63 @@ mod tests {
         changed[12] = 9;
         assert!(validate_retry_token(&seed, &peer, &changed).is_none());
     }
+}
+
+fn peer_send_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(
+            libc::ENETUNREACH
+                | libc::EHOSTUNREACH
+                | libc::ECONNREFUSED
+                | libc::EHOSTDOWN
+                | libc::ENETDOWN
+                | libc::EMSGSIZE
+        )
+    )
+}
+
+struct AuthJob {
+    user: String,
+    public_key: [u8; 32],
+    server_nonce: [u8; 32],
+    client_nonce: [u8; 32],
+    spki_hash: [u8; 32],
+    signature: [u8; 64],
+    response: mpsc::SyncSender<std::io::Result<Option<crate::tls::AuthorizedLogin>>>,
+}
+
+fn complete_authorization(
+    peer: &mut PeerSession,
+    failures: &Arc<Mutex<AuthFailureLimiter>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(receiver) = &peer.pending_auth else {
+        return Ok(());
+    };
+    let result = match receiver.try_recv() {
+        Ok(result) => result,
+        Err(TryRecvError::Empty) => return Ok(()),
+        Err(TryRecvError::Disconnected) => return Err("authorization service disconnected".into()),
+    };
+    peer.pending_auth = None;
+    if peer.conn.is_closed()
+        || peer.conn.is_draining()
+        || peer.conn.local_error().is_some()
+        || peer.state != ServerState::AuthPending
+    {
+        return Ok(());
+    }
+    let Some(login) = result? else {
+        failures
+            .lock()
+            .map_err(|_| "auth limiter lock poisoned")?
+            .record_failure(peer.peer_ip);
+        return Err("login authorization rejected".into());
+    };
+    peer.authenticated = true;
+    peer.identity = Some(login.identity);
+    peer.session_token = Some(login.token);
+    send_control(&mut peer.conn, &Message::AuthOk)?;
+    peer.state.sent(&Message::AuthOk)?;
+    Ok(())
 }

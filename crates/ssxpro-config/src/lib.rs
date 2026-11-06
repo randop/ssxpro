@@ -29,6 +29,7 @@ impl fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ConfigFeatures {
     /// Enable incremental provided-buffer ring (Linux 5.10+)
     pub iopf_buf_ring: bool,
@@ -643,6 +644,16 @@ pub fn default_client_config_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{parse_client_yaml, parse_server_yaml};
+
+    #[test]
+    fn features_default_individually_and_reject_typos() {
+        let features: super::ConfigFeatures =
+            yaml_serde::from_str("reuseport_steering: true").unwrap();
+        assert!(features.reuseport_steering);
+        assert!(!features.iopf_buf_ring);
+        assert!(!features.hugepages);
+        assert!(yaml_serde::from_str::<super::ConfigFeatures>("hugepage: true").is_err());
+    }
 
     #[test]
     fn omitted_values_use_defaults() {

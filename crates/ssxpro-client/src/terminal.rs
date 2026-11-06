@@ -187,6 +187,18 @@ impl EscapeDecoder {
 mod tests {
     use super::*;
     #[test]
+    fn pending_escape_expands_a_full_input_chunk() {
+        let mut decoder = EscapeDecoder::default();
+        let mut output = [0; 257];
+        assert_eq!(decoder.process(b"~", &mut output), (0, None));
+        let (n, action) = decoder.process(&[b'x'; 256], &mut output);
+        assert_eq!(n, 257);
+        assert_eq!(action, None);
+        assert_eq!(output[0], b'~');
+        assert_eq!(&output[1..], &[b'x'; 256]);
+    }
+
+    #[test]
     fn escapes_only_trigger_at_line_start() {
         let mut decoder = EscapeDecoder::default();
         let mut output = [0; 32];
