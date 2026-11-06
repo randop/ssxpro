@@ -1,0 +1,51 @@
+[package]
+name = "ssxpro-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ssxpro-config = { path = "../crates/ssxpro-config" }
+ssxpro-proto = { path = "../crates/ssxpro-proto" }
+ssxpro-crypto = { path = "../crates/ssxpro-crypto" }
+
+[[bin]]
+name = "config_yaml"
+path = "fuzz_targets/config_yaml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "key_files"
+path = "fuzz_targets/key_files.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proto_state"
+path = "fuzz_targets/proto_state.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proto_codec"
+path = "fuzz_targets/proto_codec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "monitor_ipc"
+path = "fuzz_targets/monitor_ipc.rs"
+test = false
+doc = false
+bench = false
