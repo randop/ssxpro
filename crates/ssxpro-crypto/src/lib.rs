@@ -24,6 +24,7 @@ pub enum CryptoError {
     Boring(boring::error::ErrorStack),
     InvalidKey,
     InvalidFormat(&'static str),
+    InvalidFileMetadata(String),
     Io(io::Error),
 }
 
@@ -34,6 +35,7 @@ impl fmt::Display for CryptoError {
             Self::Boring(error) => write!(f, "BoringSSL operation failed: {error}"),
             Self::InvalidKey => f.write_str("invalid Ed25519 key"),
             Self::InvalidFormat(message) => f.write_str(message),
+            Self::InvalidFileMetadata(message) => f.write_str(message),
             Self::Io(error) => write!(f, "I/O error: {error}"),
         }
     }
@@ -359,8 +361,17 @@ pub fn read_user_file(
     name: &str,
     max_bytes: usize,
 ) -> CryptoResult<Vec<u8>> {
+    let path = home.join(".ssx").join(name);
     let (home_fd, secure_dir_fd) = open_user_dirs(home)?;
-    read_user_file_from_dirs(home_fd, secure_dir_fd, current_euid(), name, max_bytes)
+    read_user_file_from_dirs(
+        home_fd,
+        secure_dir_fd,
+        current_euid(),
+        name,
+        max_bytes,
+        &path,
+        true,
+    )
 }
 
 pub fn read_user_file_as(
@@ -369,8 +380,39 @@ pub fn read_user_file_as(
     name: &str,
     max_bytes: usize,
 ) -> CryptoResult<Vec<u8>> {
-    let (home_fd, secure_dir_fd) = open_user_dirs_impl(home, false, owner_uid)?;
-    read_user_file_from_dirs(home_fd, secure_dir_fd, owner_uid, name, max_bytes)
+    read_user_file_as_impl(home, owner_uid, name, max_bytes, true)
+}
+
+/// Read a per-user file while skipping owner and mode checks. Intended only
+/// for `ssxd` when the operator explicitly accepts the permission risks.
+pub fn read_user_file_as_allow_insecure(
+    home: &std::path::Path,
+    owner_uid: u32,
+    name: &str,
+    max_bytes: usize,
+) -> CryptoResult<Vec<u8>> {
+    read_user_file_as_impl(home, owner_uid, name, max_bytes, false)
+}
+
+fn read_user_file_as_impl(
+    home: &std::path::Path,
+    owner_uid: u32,
+    name: &str,
+    max_bytes: usize,
+    enforce_permissions: bool,
+) -> CryptoResult<Vec<u8>> {
+    let path = home.join(".ssx").join(name);
+    let (home_fd, secure_dir_fd) =
+        open_user_dirs_impl(home, false, owner_uid, enforce_permissions)?;
+    read_user_file_from_dirs(
+        home_fd,
+        secure_dir_fd,
+        owner_uid,
+        name,
+        max_bytes,
+        &path,
+        enforce_permissions,
+    )
 }
 
 fn read_user_file_from_dirs(
@@ -379,6 +421,8 @@ fn read_user_file_from_dirs(
     owner_uid: u32,
     name: &str,
     max_bytes: usize,
+    path: &std::path::Path,
+    enforce_permissions: bool,
 ) -> CryptoResult<Vec<u8>> {
     use std::os::fd::AsRawFd;
     let file = openat2_file(
@@ -389,7 +433,9 @@ fn read_user_file_from_dirs(
         STRICT_RESOLVE,
     )?;
     let metadata = file.metadata()?;
-    check_file_metadata_as(&metadata, 0o600, "private file", owner_uid)?;
+    if enforce_permissions {
+        check_file_metadata_as(path, &metadata, 0o600, owner_uid)?;
+    }
     let mut contents = Vec::with_capacity(metadata.len().min(max_bytes as u64) as usize);
     let mut limited = file.take(max_bytes as u64 + 1);
     use std::io::Read;
@@ -419,7 +465,7 @@ pub fn write_user_file_new(
         STRICT_RESOLVE,
     )?;
     let metadata = file.metadata()?;
-    check_file_metadata(&metadata, 0o600, "private file")?;
+    check_file_metadata(&home.join(".ssx").join(name), &metadata, 0o600)?;
     use std::io::Write;
     let mut file = file;
     file.write_all(contents)?;
@@ -446,7 +492,7 @@ pub fn append_user_file(
         STRICT_RESOLVE,
     )?;
     let metadata = file.metadata()?;
-    check_file_metadata(&metadata, 0o600, "private file")?;
+    check_file_metadata(&home.join(".ssx").join(name), &metadata, 0o600)?;
     if metadata.len().saturating_add(contents.len() as u64) > max_bytes as u64 {
         return Err(CryptoError::InvalidFormat(
             "private file exceeds configured size limit",
@@ -459,20 +505,30 @@ pub fn append_user_file(
 }
 
 pub fn read_private_key(path: &std::path::Path, max_bytes: usize) -> CryptoResult<Vec<u8>> {
-    read_strict_file(path, max_bytes, "private key exceeds size limit")
+    read_strict_file(path, max_bytes, "private key exceeds size limit", true)
 }
 
 /// Read a server-owned file with strict metadata checks: regular file, owned
 /// by the current euid, exact mode 0600, and no symlinks. Used for a
 /// system-wide `authorized_keys` file owned by root.
 pub fn read_server_file(path: &std::path::Path, max_bytes: usize) -> CryptoResult<Vec<u8>> {
-    read_strict_file(path, max_bytes, "server file exceeds size limit")
+    read_strict_file(path, max_bytes, "server file exceeds size limit", true)
+}
+
+/// Read a server-owned file while skipping owner and mode checks. Intended
+/// only for `ssxd` when the operator explicitly accepts the permission risks.
+pub fn read_server_file_allow_insecure(
+    path: &std::path::Path,
+    max_bytes: usize,
+) -> CryptoResult<Vec<u8>> {
+    read_strict_file(path, max_bytes, "server file exceeds size limit", false)
 }
 
 fn read_strict_file(
     path: &std::path::Path,
     max_bytes: usize,
     size_error: &'static str,
+    enforce_permissions: bool,
 ) -> CryptoResult<Vec<u8>> {
     use std::os::fd::FromRawFd;
     let path_c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
@@ -498,7 +554,9 @@ fn read_strict_file(
     // SAFETY: openat2 returned a new owned file descriptor.
     let file = unsafe { std::fs::File::from_raw_fd(fd) };
     let metadata = file.metadata()?;
-    check_file_metadata(&metadata, 0o600, "strict file")?;
+    if enforce_permissions {
+        check_file_metadata(path, &metadata, 0o600)?;
+    }
     let mut data = Vec::new();
     use std::io::Read;
     file.take(max_bytes as u64 + 1).read_to_end(&mut data)?;
@@ -509,17 +567,18 @@ fn read_strict_file(
 }
 
 fn open_user_dirs(home: &std::path::Path) -> CryptoResult<(std::fs::File, std::fs::File)> {
-    open_user_dirs_impl(home, false, current_euid())
+    open_user_dirs_impl(home, false, current_euid(), true)
 }
 
 fn open_user_dirs_create(home: &std::path::Path) -> CryptoResult<(std::fs::File, std::fs::File)> {
-    open_user_dirs_impl(home, true, current_euid())
+    open_user_dirs_impl(home, true, current_euid(), true)
 }
 
 fn open_user_dirs_impl(
     home: &std::path::Path,
     create: bool,
     owner_uid: u32,
+    enforce_permissions: bool,
 ) -> CryptoResult<(std::fs::File, std::fs::File)> {
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
@@ -546,7 +605,9 @@ fn open_user_dirs_impl(
     // SAFETY: openat2 returned a new owned descriptor.
     let home_file = unsafe { std::fs::File::from_raw_fd(home_fd) };
     let home_meta = home_file.metadata()?;
-    check_directory_metadata_as(&home_meta, false, "home directory", owner_uid)?;
+    if enforce_permissions {
+        check_directory_metadata_as(&home_meta, false, "home directory", owner_uid)?;
+    }
 
     let secure_name = std::ffi::CString::new(".ssx").expect("static string");
     if create {
@@ -567,7 +628,9 @@ fn open_user_dirs_impl(
         STRICT_RESOLVE,
     )?;
     let secure_meta = secure_file.metadata()?;
-    check_directory_metadata_as(&secure_meta, true, ".ssx directory", owner_uid)?;
+    if enforce_permissions {
+        check_directory_metadata_as(&secure_meta, true, ".ssx directory", owner_uid)?;
+    }
     Ok((home_file, secure_file))
 }
 
@@ -627,27 +690,36 @@ fn check_directory_metadata_as(
 }
 
 fn check_file_metadata(
+    path: &std::path::Path,
     metadata: &std::fs::Metadata,
     required_mode: u32,
-    _description: &str,
 ) -> CryptoResult<()> {
-    check_file_metadata_as(metadata, required_mode, _description, current_euid())
+    check_file_metadata_as(path, metadata, required_mode, current_euid())
 }
 
 fn check_file_metadata_as(
+    path: &std::path::Path,
     metadata: &std::fs::Metadata,
     required_mode: u32,
-    _description: &str,
     owner_uid: u32,
 ) -> CryptoResult<()> {
     use std::os::unix::fs::MetadataExt;
-    if !metadata.is_file()
-        || metadata.uid() != owner_uid
-        || metadata.mode() & 0o7777 != required_mode
-    {
-        return Err(CryptoError::InvalidFormat(
-            "file type, owner, or mode does not satisfy strict modes",
-        ));
+    let mode = metadata.mode() & 0o7777;
+    let issue = if !metadata.is_file() {
+        Some("not a regular file")
+    } else if metadata.uid() != owner_uid {
+        Some("unexpected owner")
+    } else if mode != required_mode {
+        Some("unexpected permissions")
+    } else {
+        None
+    };
+    if let Some(issue) = issue {
+        return Err(CryptoError::InvalidFileMetadata(format!(
+            "{}: {issue} (expected a regular file owned by uid {owner_uid} with mode {required_mode:04o}; found uid {} with mode {mode:04o})",
+            path.display(),
+            metadata.uid()
+        )));
     }
     Ok(())
 }
@@ -755,7 +827,14 @@ mod tests {
             std::fs::Permissions::from_mode(0o640),
         )
         .unwrap();
-        assert!(read_user_file(&home, "key", 16).is_err());
+        let error = read_user_file(&home, "key", 16).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains(&home.join(".ssx/key").display().to_string()),
+            "{message}"
+        );
+        assert!(message.contains("unexpected permissions"), "{message}");
+        assert!(message.contains("0640"), "{message}");
         std::fs::remove_file(home.join(".ssx/key")).unwrap();
         let outside = home.join("outside");
         std::fs::write(&outside, b"secret").unwrap();
@@ -775,7 +854,11 @@ mod tests {
         let path = dir.join("authorized_keys");
         std::fs::write(&path, b"ed25519 AAAA\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(read_server_file(&path, 1024).is_err());
+        let error = read_server_file(&path, 1024).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(message.contains("unexpected permissions"), "{message}");
+        assert!(message.contains("0644"), "{message}");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(read_server_file(&path, 1024).unwrap(), b"ed25519 AAAA\n");
         std::fs::remove_file(&path).unwrap();

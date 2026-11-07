@@ -43,6 +43,13 @@ struct AuthCheckJob {
     response: SyncSender<Option<crate::session::LoginIdentity>>,
 }
 
+pub struct AuthSettings {
+    pub allow_root: bool,
+    pub server_authorized_keys: PathBuf,
+    pub authorized_keys_name: String,
+    pub allow_insecure_permissions: bool,
+}
+
 #[derive(Clone)]
 pub struct TlsIdentity {
     pub certificate_der: Vec<u8>,
@@ -287,9 +294,7 @@ pub fn serve_signing_requests(
     stream: UnixStream,
     auth_stream: UnixStream,
     mut seed: Zeroizing<[u8; 32]>,
-    allow_root: bool,
-    server_authorized_keys: PathBuf,
-    authorized_keys_name: String,
+    settings: AuthSettings,
     token_secret: [u8; 32],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let token_secret = Zeroizing::new(token_secret);
@@ -308,20 +313,15 @@ pub fn serve_signing_requests(
     let pair = pair_result?;
     // `_exit` bypasses Rust destructors, so clear the inherited host seed now.
     seed.zeroize();
-    if authorized_keys_name.is_empty()
-        || authorized_keys_name.contains('/')
-        || authorized_keys_name == "."
-        || authorized_keys_name == ".."
+    if settings.authorized_keys_name.is_empty()
+        || settings.authorized_keys_name.contains('/')
+        || settings.authorized_keys_name == "."
+        || settings.authorized_keys_name == ".."
     {
         return Err("authorized_keys must be a basename".into());
     }
     let (auth_sender, auth_receiver) = mpsc::sync_channel::<AuthCheckJob>(8);
-    spawn_auth_check_thread(
-        auth_receiver,
-        allow_root,
-        server_authorized_keys,
-        authorized_keys_name.clone(),
-    )?;
+    spawn_auth_check_thread(auth_receiver, settings)?;
     let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("ssxd-monitor-auth".to_owned())
@@ -443,9 +443,7 @@ pub fn serve_signing_requests(
 
 fn spawn_auth_check_thread(
     receiver: Receiver<AuthCheckJob>,
-    allow_root: bool,
-    server_authorized_keys: PathBuf,
-    authorized_keys_name: String,
+    settings: AuthSettings,
 ) -> io::Result<()> {
     let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
     std::thread::Builder::new()
@@ -460,12 +458,7 @@ fn spawn_auth_check_thread(
                 return;
             }
             while let Ok(job) = receiver.recv() {
-                let identity = verify_login_request(
-                    job.request,
-                    allow_root,
-                    &server_authorized_keys,
-                    &authorized_keys_name,
-                );
+                let identity = verify_login_request(job.request, &settings);
                 let _ = job.response.send(identity);
             }
         })?;
@@ -487,11 +480,19 @@ fn parse_keys_file(path: &Path, bytes: &[u8]) -> Result<Vec<Ed25519PublicKey>, S
 
 /// Load the server-wide key list configured in `ssxd.yaml`. `Ok(None)` means
 /// the setting is empty or the file does not exist (both are non-fatal).
-fn load_server_authorized_keys(path: &Path) -> Result<Option<Vec<Ed25519PublicKey>>, String> {
+fn load_server_authorized_keys(
+    path: &Path,
+    allow_insecure_permissions: bool,
+) -> Result<Option<Vec<Ed25519PublicKey>>, String> {
     if path.as_os_str().is_empty() {
         return Ok(None);
     }
-    match ssxpro_crypto::read_server_file(path, MAX_AUTHORIZED_KEYS_BYTES) {
+    let read = if allow_insecure_permissions {
+        ssxpro_crypto::read_server_file_allow_insecure(path, MAX_AUTHORIZED_KEYS_BYTES)
+    } else {
+        ssxpro_crypto::read_server_file(path, MAX_AUTHORIZED_KEYS_BYTES)
+    };
+    match read {
         Ok(bytes) => Ok(Some(parse_keys_file(path, &bytes)?)),
         Err(ssxpro_crypto::CryptoError::Io(error))
             if error.kind() == std::io::ErrorKind::NotFound =>
@@ -508,18 +509,26 @@ fn load_user_authorized_keys(
     home: &Path,
     owner_uid: u32,
     name: &str,
+    allow_insecure_permissions: bool,
 ) -> Result<Vec<Ed25519PublicKey>, String> {
     let path = home.join(".ssx").join(name);
-    let bytes = ssxpro_crypto::read_user_file_as(home, owner_uid, name, MAX_AUTHORIZED_KEYS_BYTES)
-        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let read = if allow_insecure_permissions {
+        ssxpro_crypto::read_user_file_as_allow_insecure(
+            home,
+            owner_uid,
+            name,
+            MAX_AUTHORIZED_KEYS_BYTES,
+        )
+    } else {
+        ssxpro_crypto::read_user_file_as(home, owner_uid, name, MAX_AUTHORIZED_KEYS_BYTES)
+    };
+    let bytes = read.map_err(|error| format!("{}: {error}", path.display()))?;
     parse_keys_file(&path, &bytes)
 }
 
 fn verify_login_request(
     request: AuthCheck,
-    allow_root: bool,
-    server_authorized_keys: &Path,
-    authorized_keys_name: &str,
+    settings: &AuthSettings,
 ) -> Option<crate::session::LoginIdentity> {
     // The peer only ever sees the coarse AuthFail/close; the specific reason is
     // a local log line for the operator (SPEC.md: details are logged locally by
@@ -527,19 +536,26 @@ fn verify_login_request(
     // control characters or newlines into the log stream.
     let user = request.user.escape_default().to_string();
     let result = || -> Result<Option<crate::session::LoginIdentity>, Box<dyn std::error::Error>> {
-        let identity = crate::session::lookup_login_identity(&request.user, allow_root)?;
+        let identity = crate::session::lookup_login_identity(&request.user, settings.allow_root)?;
         let presented = Ed25519PublicKey(request.public_key);
         // Server-wide keys from ssxd.yaml are checked first; the per-user
         // file is only consulted when the server-wide list does not match.
-        let server_match = match load_server_authorized_keys(server_authorized_keys)? {
+        let server_match = match load_server_authorized_keys(
+            &settings.server_authorized_keys,
+            settings.allow_insecure_permissions,
+        )? {
             Some(keys) => keys
                 .iter()
                 .any(|key| constant_time_eq(&key.0, &presented.0)),
             None => false,
         };
         if !server_match {
-            let trusted =
-                load_user_authorized_keys(&identity.home, identity.uid, authorized_keys_name)?;
+            let trusted = load_user_authorized_keys(
+                &identity.home,
+                identity.uid,
+                &settings.authorized_keys_name,
+                settings.allow_insecure_permissions,
+            )?;
             if !trusted
                 .iter()
                 .any(|key| constant_time_eq(&key.0, &presented.0))
@@ -718,13 +734,15 @@ mod tests {
         std::fs::set_permissions(&server_path, std::fs::Permissions::from_mode(0o600)).unwrap();
 
         // Server-wide file: loaded when configured, skipped when absent or empty.
-        let server = load_server_authorized_keys(&server_path).unwrap().unwrap();
+        let server = load_server_authorized_keys(&server_path, false)
+            .unwrap()
+            .unwrap();
         assert_eq!(server.len(), 1);
         assert_eq!(server[0].0, [0u8; 32]);
-        assert!(load_server_authorized_keys(&base.join("missing"))
+        assert!(load_server_authorized_keys(&base.join("missing"), false)
             .unwrap()
             .is_none());
-        assert!(load_server_authorized_keys(Path::new(""))
+        assert!(load_server_authorized_keys(Path::new(""), false)
             .unwrap()
             .is_none());
 
@@ -737,10 +755,46 @@ mod tests {
         .unwrap();
         // SAFETY: geteuid has no arguments or side effects.
         let uid = unsafe { libc::geteuid() };
-        let user = load_user_authorized_keys(&home, uid, "authorized_keys").unwrap();
+        let user = load_user_authorized_keys(&home, uid, "authorized_keys", false).unwrap();
         assert_eq!(user.len(), 1);
         assert_eq!(user[0].0, [1u8; 32]);
-        assert!(load_user_authorized_keys(&home, uid, "missing").is_err());
+        assert!(load_user_authorized_keys(&home, uid, "missing", false).is_err());
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn authorized_keys_allow_insecure_skips_permission_checks() {
+        use std::os::unix::fs::PermissionsExt;
+        const SERVER_KEY: &str = "ed25519 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n";
+        const USER_KEY: &str = "ed25519 AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=\n";
+
+        let base =
+            std::env::temp_dir().join(format!("ssxpro-auth-insecure-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let home = base.join("home");
+        std::fs::create_dir_all(home.join(".ssx")).unwrap();
+        // Permissive directories and files that the strict checks reject.
+        for dir in [&base, &home, &home.join(".ssx")] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let server_path = base.join("server_authorized_keys");
+        std::fs::write(&server_path, SERVER_KEY).unwrap();
+        std::fs::set_permissions(&server_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(load_server_authorized_keys(&server_path, false).is_err());
+        let server = load_server_authorized_keys(&server_path, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(server.len(), 1);
+
+        let user_path = home.join(".ssx/authorized_keys");
+        std::fs::write(&user_path, USER_KEY).unwrap();
+        std::fs::set_permissions(&user_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // SAFETY: geteuid has no arguments or side effects.
+        let uid = unsafe { libc::geteuid() };
+        assert!(load_user_authorized_keys(&home, uid, "authorized_keys", false).is_err());
+        let user = load_user_authorized_keys(&home, uid, "authorized_keys", true).unwrap();
+        assert_eq!(user.len(), 1);
 
         std::fs::remove_dir_all(&base).unwrap();
     }

@@ -6,7 +6,7 @@
 
 Both programs deserialize YAML into strict, typed structures. Unknown keys and wrong types are errors; all omitted keys receive the defaults shown below. Range and cross-field errors identify the YAML key and line. Parser errors include the YAML parser's line and column.
 
-`ssxd` reads `/etc/ssx/ssxd.yaml` by default. `--config PATH` selects another file. `ssxd --check-config` validates YAML, requires the configuration and host-key files to be regular files owned by root with exact mode `0600`, opens them with `openat2(RESOLVE_NO_SYMLINKS)`, then reports kernel feature checks. The host key is exactly 32 raw Ed25519 seed bytes.
+`ssxd` reads `/etc/ssx/ssxd.yaml` by default. `--config PATH` selects another file. `ssxd --check-config` validates YAML, requires the configuration and host-key files to be regular files owned by root with exact mode `0600`, opens them with `openat2(RESOLVE_NO_SYMLINKS)`, then reports kernel feature checks. The host key is exactly 32 raw Ed25519 seed bytes. `--yes-I-know-permission-risks-go-ahead-please` skips owner and mode checks for the configuration, host key, and both authorized_keys sources; use it only for unprivileged development.
 
 ```yaml
 listen: "0.0.0.0:22"
@@ -53,7 +53,7 @@ log:
   json: false
 ```
 
-`ssx` reads `~/.ssx/config.yaml` by default, expanding the home directory from `$HOME`. It accepts `--config PATH` and `--check-config`.
+`ssx` reads `~/.ssx/config.yaml` by default, expanding the home directory from `$HOME`. If that file does not exist, built-in defaults are used; without a config file the target must include an explicit port (`USER@HOST:PORT`). It accepts `--config PATH` (which must exist) and `--check-config`.
 
 ```yaml
 hosts:
@@ -69,10 +69,12 @@ idle_timeout_secs: 600
 server_alive_interval_secs: 15
 server_alive_count_max: 6
 known_hosts: /home/alice/.ssx/known_hosts
-known_hosts_policy: reject
+known_hosts_policy: ask
 ```
 
-Client `known_hosts_policy` is `reject` or `accept-new`. Host aliases require a nonempty host. Alias fields inherit global port and identity when omitted.
+Client `known_hosts_policy` is `deny`, `ask` (default), or `approve`. `deny` rejects a host that is not already pinned; `ask` prints the server key fingerprint and prompts `Allow this host? (Y/n)`, defaulting to yes; `approve` saves an unknown host key without prompting. A changed host key is always a fatal error. Accepted keys are appended to the secure default `~/.ssx/known_hosts` (directory mode `0700`, file mode `0600`); a custom `known_hosts` path must already contain the pin. `--approve-host` automatically approves and saves an unknown host key for one connection, overriding the configured policy.
+
+The target is `USER@HOST[:PORT]` or a configured host alias. Bracket an IPv6 literal when supplying a port, for example `alice@[2001:db8::1]:2222`. A port in the target overrides an alias or config port; `--port` overrides both. Host aliases require a nonempty host. Alias fields inherit global port and identity when omitted.
 
 ## Idle timeouts and keepalives
 
@@ -97,7 +99,7 @@ Configured opt-in features fail closed. The probe prints `PASS` or `FAIL` for re
 Public keys are checked in two places, in order:
 
 1. `auth.server_authorized_keys`: an absolute path (default `/etc/ssx/authorized_keys`). A missing file is skipped; an existing file must be a regular file owned by the monitor's user (root in production) with exact mode `0600`. A key listed here authorizes that key for any local account, subject to `allow_root` and the account shell policy, so treat the file as root-only.
-2. `~USER/.ssx/<auth.authorized_keys>` (default `authorized_keys`): the per-user file, read only when the server-wide list did not match. Home, `.ssx`, and key-file ownership and modes are checked before reading.
+2. `~USER/.ssx/<auth.authorized_keys>` (default `authorized_keys`): the per-user file, read only when the server-wide list did not match. Home, `.ssx`, and key-file ownership and modes are checked before reading. The permission-risk override flag skips these checks for unprivileged development.
 
 Each non-comment line in either file is `ed25519 BASE64_KEY [comment]`; any option or unknown token rejects the line.
 

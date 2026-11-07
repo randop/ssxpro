@@ -37,7 +37,7 @@ Status: In progress (2026-11-04) — M0–M3 complete; M5 functional end-to-end;
 
 * The ring runtime falls back to direct `sendmsg`/`recvmsg`/`read`/`write` when unprivileged io_uring submission is restricted (`SSXPRO_USE_IO_URING=1` opts back in). The io_uring-only rule is not yet enforced on every path.
 * The local dev host runs Linux 6.8 (below the 6.12 baseline) without Landlock. The PTY pump warns and continues with seccomp only; a fail-closed baseline probe is still required.
-* Unprivileged dev mode (`--skip-config-permissions`, broker already running as the target account) exists for local testing; production remains root plus strict permissions.
+* Unprivileged dev mode (`--yes-I-know-permission-risks-go-ahead-please`, broker already running as the target account) exists for local testing; production remains root plus strict permissions.
 * The GitHub CI workflow was removed from the tree. `fmt`/`clippy`/`test`/`audit`/`deny` run locally through `scripts/cargo-pinned.sh`; the kernel matrix job is only documented in `docs/ci-kernels.md`.
 
 ## Architecture
@@ -144,7 +144,7 @@ io:
 * Configuration paths: `ssxd` reads `/etc/ssx/ssxd.yaml` and `ssx` reads `~/.ssx/config.yaml`; per-user keys, `authorized_keys`, and `known_hosts` live under `~/.ssx` (renamed from `/etc/ssxpro` and `~/.ssxpro`).
 * Both config types parse strictly with defaults; unknown keys, wrong types and range errors report the YAML key and source line (unit tests cover each case).
 * `ssxd --check-config` runs the kernel probe and reports PASS/FAIL/SKIP per feature; exit codes are documented in `docs/configuration.md` and covered by tests (`masked_requested_feature_is_a_hard_failure`, CLI usage/config exit codes).
-* Config and host-key reads use `openat2` with `RESOLVE_NO_SYMLINKS`; `--skip-config-permissions` exists for unprivileged dev runs only.
+* Config, host-key, and authorized_keys reads use `openat2` with `RESOLVE_NO_SYMLINKS`; `--yes-I-know-permission-risks-go-ahead-please` exists for unprivileged dev runs only and skips owner/mode checks for all of them.
 * `config/ssxd.example.yaml` and `config/ssx.example.yaml` are complete examples; `features:` gates the optional server features.
 * Fuzz target `fuzz/fuzz_targets/config_yaml.rs` covers both parsers.
 
@@ -313,7 +313,7 @@ The first working client and server on the ring runtime: handshake, pinning, aut
 
 * quiche on BoringSSL inside the ring loops of `ssxd` and `ssx` (sans-IO quiche, fed by `ssxpro-io`).
 * Self-signed cert generated from the Ed25519 host key. Identity is the **SPKI SHA-256 fingerprint**, so cert regeneration doesn't matter.
-* Client sets `verify_peer(false)` and compares the SPKI fingerprint against `known_hosts` **before sending anything sensitive**. First connect prompts, or `--accept-new`.
+* Client sets `verify_peer(false)` and compares the SPKI fingerprint against `known_hosts` **before sending anything sensitive**. First connect prompts `(Y/n)`, or `--approve-host` saves the key without prompting.
 * Auth per the M3 spec (exporter binding if available, else nonce plus SPKI hash). Signature verification is a stub call to the monitor interface in this milestone.
 * 0-RTT disabled, Retry required, hello grace timer, max control frame size enforced.
 * Echo over stream 4 to prove the data path.
@@ -378,7 +378,7 @@ The privileged monitor, the IPC to workers, and the PTY shell session lifecycle,
 
 * Implemented: a forked monitor that owns the host key, verifies Ed25519 signatures, resolves NSS on a dedicated thread with a 3 s deadline, checks policy and strict-mode `authorized_keys`, and mints one-time session tokens; a forked broker that owns `openpty`/`TIOCGPTPEER`, spawns the login shell (`setsid`, `TIOCSCTTY`, `setgroups`/`setresgid`/`setresuid`, `chdir`, cleared env, login argv0, `PR_SET_PDEATHSIG`), observes exit with `waitid(P_PIDFD)` and cleans up process groups; `SOCK_SEQPACKET` worker/broker IPC with bounded frames and `SCM_RIGHTS` for the PTY master; PTY master installed as a registered direct descriptor; `Resize` via `TIOCSWINSZ`; `Signal` via process-group kill; `Exit` then stream-4 FIN after drain.
 * Verified end to end: interactive shell login and command round-trip, exit status 0 and 7, session teardown on client disconnect, no stuck sessions across repeated runs.
-* Unprivileged dev mode: when the broker already runs as the target account (`--skip-config-permissions`), privilege-drop syscalls are skipped; any other unprivileged identity mismatch fails closed.
+* Unprivileged dev mode: when the broker already runs as the target account (`--yes-I-know-permission-risks-go-ahead-please`), privilege-drop syscalls are skipped; any other unprivileged identity mismatch fails closed.
 * Not yet implemented: `clone3` + `CLONE_INTO_CGROUP` and cgroup v2 limits/`cgroup.kill`, `PR_SET_CHILD_SUBREAPER`, `READ_MULTISHOT` (the pump uses single-shot `READ`), `pidfd_send_signal`, in-ring `WAITID`, and monitor ring ops (the monitor uses blocking reads on its sockets).
 
 ## Acceptance criteria
@@ -404,7 +404,7 @@ The `ssx` client: one ring, low latency, a robust terminal experience.
 
 ## Scope
 
-* CLI: `ssx [-i key] [-p port] [--accept-new] [-v] user@host`, plus subcommands `ssx keygen` and `ssx fingerprint`.
+* CLI: `ssx [-i key] [-p port] [--approve-host] [-v] user@host[:port]`, plus subcommands `ssx keygen` and `ssx fingerprint`.
 * **One ring** (`SINGLE_ISSUER | DEFER_TASKRUN`) driving everything:
   * TTY stdin `READ` (re-armed, small buffer, flushed immediately)
   * UDP multishot `RECVMSG`, `SENDMSG` (GSO when available)
@@ -421,7 +421,7 @@ The `ssx` client: one ring, low latency, a robust terminal experience.
 
 ## Progress
 
-* Implemented: the full CLI (target, `-i`, `-p`, `--accept-new`, `-v`, `--config`, `--check-config`, `keygen`, `fingerprint`), host aliases, `known_hosts` prompt/pin flow with a loud mismatch failure, raw mode with restore-on-drop and SIGTERM/SIGHUP handlers, resize via `SIGWINCH` + `TIOCGWINSZ` + `Resize`, OpenSSH-style escapes, and remote-exit-code propagation (verified: 0 and 7; failures exit 255).
+* Implemented: the full CLI (target, `-i`, `-p`, `--approve-host`, `-v`, `--config`, `--check-config`, `keygen`, `fingerprint`), host aliases, `known_hosts` prompt/pin flow with a loud mismatch failure, raw mode with restore-on-drop and SIGTERM/SIGHUP handlers, resize via `SIGWINCH` + `TIOCGWINSZ` + `Resize`, OpenSSH-style escapes, and remote-exit-code propagation (verified: 0 and 7; failures exit 255).
 * Not yet one ring: the client uses a main ring plus a stdin reader thread with its own ring, and falls back to direct syscalls where io_uring is restricted. There is no `signalfd` (handlers set atomic flags), no `IORING_OP_CONNECT`/`SOCKET` (std UDP socket + `quiche::connect`), and no single-tick keystroke path.
 * Type-ahead typed before raw mode is flushed by `TCSAFLUSH`; fine for normal use, noted for the test harness.
 * Not yet verified/measured: terminal restoration under kill/panic (pty-driven tests), the full escape matrix, resize/signal forwarding end to end, `strace` epoll check, and keystroke latency.

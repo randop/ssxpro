@@ -180,6 +180,7 @@ extern "C" fn request_shutdown(_: libc::c_int) {
 pub fn serve(
     config: &ssxpro_config::ServerConfig,
     verbose: u8,
+    skip_permission_checks: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     SHUTDOWN_REQUESTED.store(false, Ordering::Relaxed);
     debug1!(verbose, "ssxd starting on {}", config.listen);
@@ -214,7 +215,8 @@ pub fn serve(
         .min(config.session.max_sessions as usize);
     let mut token_secret = Zeroizing::new([0u8; 32]);
     getrandom(&mut *token_secret)?;
-    let (tls_identity, tls_signer, tls_monitor) = start_tls_monitor(config, *token_secret)?;
+    let (tls_identity, tls_signer, tls_monitor) =
+        start_tls_monitor(config, *token_secret, skip_permission_checks)?;
     let (_session_broker, session_channels) =
         crate::broker::start_session_broker(*token_secret, worker_count)?;
     token_secret.zeroize();
@@ -380,6 +382,7 @@ impl Drop for TlsMonitorProcess {
 fn start_tls_monitor(
     config: &ssxpro_config::ServerConfig,
     token_secret: [u8; 32],
+    skip_permission_checks: bool,
 ) -> Result<
     (
         crate::tls::TlsIdentity,
@@ -427,13 +430,17 @@ fn start_tls_monitor(
             // SAFETY: _exit is async-signal-safe and avoids running inherited destructors.
             unsafe { libc::_exit(1) }
         }
+        let settings = crate::tls::AuthSettings {
+            allow_root: config.auth.allow_root,
+            server_authorized_keys: config.auth.server_authorized_keys.clone(),
+            authorized_keys_name,
+            allow_insecure_permissions: skip_permission_checks,
+        };
         let result = crate::tls::serve_signing_requests(
             monitor_stream,
             monitor_auth,
             seed,
-            config.auth.allow_root,
-            config.auth.server_authorized_keys.clone(),
-            authorized_keys_name,
+            settings,
             *token_secret,
         );
         // SAFETY: the forked monitor must not run inherited process destructors.

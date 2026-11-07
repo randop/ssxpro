@@ -32,9 +32,9 @@ struct Args {
     /// Validate the configuration, protected host key, and kernel capabilities; then exit.
     #[arg(long)]
     check_config: bool,
-    /// Skip config file and host key owner checks (uid 0 required)
-    #[arg(long)]
-    skip_config_permissions: bool,
+    /// Skip config, host key, and authorized_keys permission checks
+    #[arg(long = "yes-I-know-permission-risks-go-ahead-please")]
+    skip_permission_checks: bool,
     /// Increase verbosity (repeat for more: -v, -vv, -vvv).
     #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count, default_value_t = 0)]
     verbose: u8,
@@ -56,11 +56,11 @@ fn main() -> ExitCode {
 }
 
 fn run(args: &Args) -> Result<(), (u8, String)> {
-    let config_text = read_server_config(&args.config, args.skip_config_permissions)
+    let config_text = read_server_config(&args.config, args.skip_permission_checks)
         .map_err(|error| (EXIT_CONFIG, error))?;
     let config =
         parse_server_yaml(&config_text).map_err(|error| (EXIT_CONFIG, error.to_string()))?;
-    check_server_files(&config, args.skip_config_permissions)
+    check_server_files(&config, args.skip_permission_checks)
         .map_err(|error| (EXIT_CONFIG, error))?;
     let options = ProbeOptions {
         ring_entries: config.io.ring_entries,
@@ -93,7 +93,7 @@ fn run(args: &Args) -> Result<(), (u8, String)> {
         println!("configuration and kernel capabilities are valid");
         return Ok(());
     }
-    transport::serve(&config, args.verbose).map_err(|error| {
+    transport::serve(&config, args.verbose, args.skip_permission_checks).map_err(|error| {
         (
             EXIT_NOT_IMPLEMENTED,
             format!("server runtime failed: {error}"),
@@ -101,11 +101,11 @@ fn run(args: &Args) -> Result<(), (u8, String)> {
     })
 }
 
-fn read_server_config(path: &Path, skip_config_permissions: bool) -> Result<String, String> {
+fn read_server_config(path: &Path, skip_permission_checks: bool) -> Result<String, String> {
     let file = openat2_nosymlink(path)
         .map_err(|error| format!("cannot open config {}: {error}", path.display()))?;
-    if !skip_config_permissions {
-        check_secure_metadata(&file, 0, 0o600, "config file")?;
+    if !skip_permission_checks {
+        check_secure_metadata(path, &file, 0, 0o600, "config file")?;
     }
     let mut contents = String::new();
     file.take(MAX_CONFIG_BYTES + 1)
@@ -117,15 +117,15 @@ fn read_server_config(path: &Path, skip_config_permissions: bool) -> Result<Stri
     Ok(contents)
 }
 
-fn check_server_files(config: &ServerConfig, skip_config_permissions: bool) -> Result<(), String> {
+fn check_server_files(config: &ServerConfig, skip_permission_checks: bool) -> Result<(), String> {
     let key = openat2_nosymlink(&config.host_key).map_err(|error| {
         format!(
             "cannot open host key {}: {error}",
             config.host_key.display()
         )
     })?;
-    if !skip_config_permissions {
-        check_secure_metadata(&key, 0, 0o600, "host key")?;
+    if !skip_permission_checks {
+        check_secure_metadata(&config.host_key, &key, 0, 0o600, "host key")?;
     }
     let metadata = key.metadata().map_err(|error| {
         format!(
@@ -157,28 +157,36 @@ pub fn read_host_key_seed(path: &Path) -> Result<[u8; 32], String> {
 }
 
 fn check_secure_metadata(
+    path: &Path,
     file: &File,
     required_uid: u32,
     required_mode: u32,
     description: &str,
 ) -> Result<(), String> {
+    let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     let metadata = file
         .metadata()
-        .map_err(|error| format!("cannot inspect {description}: {error}"))?;
+        .map_err(|error| format!("cannot inspect {description} {}: {error}", path.display()))?;
     if !metadata.file_type().is_file() {
-        return Err(format!("{description} must be a regular file"));
+        return Err(format!(
+            "{} {description} must be a regular file",
+            path.display()
+        ));
     }
     if metadata.uid() != required_uid {
         return Err(format!(
-            "{description} must be owned by uid {required_uid}, got uid {}",
+            "{} {description} must be owned by uid {required_uid}, got uid {}",
+            path.display(),
             metadata.uid()
         ));
     }
     let mode = metadata.mode() & 0o7777;
     if mode != required_mode {
         return Err(format!(
-            "{description} permissions must be {:04o}, got {:04o}",
-            required_mode, mode
+            "{} {description} permissions must be {:04o}, got {:04o}",
+            path.display(),
+            required_mode,
+            mode
         ));
     }
     Ok(())
@@ -235,10 +243,22 @@ mod tests {
         let args = Args {
             config: PathBuf::from("/ssxpro-test-config-does-not-exist.yaml"),
             check_config: true,
-            skip_config_permissions: false,
+            skip_permission_checks: false,
             verbose: 0,
         };
         let error = run(&args).expect_err("missing config must fail validation");
         assert_eq!(error.0, EXIT_CONFIG);
+    }
+
+    #[test]
+    fn permission_override_uses_explicit_long_flag() {
+        let args = Args::try_parse_from([
+            "ssxd",
+            "--yes-I-know-permission-risks-go-ahead-please",
+            "--check-config",
+        ])
+        .expect("explicit permission override flag must be accepted");
+        assert!(args.skip_permission_checks);
+        assert!(Args::try_parse_from(["ssxd", "--skip-config-permissions"]).is_err());
     }
 }

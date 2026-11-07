@@ -2,6 +2,7 @@ use crate::terminal::{take_resize_pending, EscapeAction, EscapeDecoder, RawMode}
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use boring::x509::X509;
+use ssxpro_config::KnownHostsPolicy;
 use ssxpro_crypto::{
     append_user_file, auth_signing_bytes, fingerprint_spki, getrandom, parse_known_hosts,
     read_private_key, read_user_file, sha256, verify_known_host, CryptoError, Ed25519Keypair,
@@ -41,18 +42,86 @@ macro_rules! debug3 {
     };
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Target<'a> {
+    pub user: &'a str,
+    pub host: &'a str,
+    pub port: Option<u16>,
+}
+
+/// Parse `USER@HOST[:PORT]`. Bracket the host to give an IPv6 literal a port,
+/// for example `alice@[2001:db8::1]:2222`.
+pub fn parse_target(target: &str) -> Result<Target<'_>, Box<dyn std::error::Error>> {
+    let (user, destination) = target
+        .split_once('@')
+        .ok_or("target must be USER@HOST:PORT")?;
+    if user.is_empty()
+        || user.len() > 256
+        || user
+            .chars()
+            .any(|ch| ch == '\0' || ch.is_ascii_whitespace())
+    {
+        return Err("target user must be 1 to 256 bytes without whitespace or NUL".into());
+    }
+    if destination.is_empty() || destination.contains('@') {
+        return Err("target must be USER@HOST:PORT".into());
+    }
+    let (host, port) = parse_host_and_port(destination)?;
+    if host.is_empty()
+        || host.len() > 253
+        || host
+            .chars()
+            .any(|ch| ch == '\0' || ch.is_ascii_whitespace())
+    {
+        return Err("target host must be 1 to 253 bytes without whitespace or NUL".into());
+    }
+    Ok(Target { user, host, port })
+}
+
+fn parse_host_and_port(
+    destination: &str,
+) -> Result<(&str, Option<u16>), Box<dyn std::error::Error>> {
+    if let Some(bracketed) = destination.strip_prefix('[') {
+        let (host, rest) = bracketed
+            .split_once(']')
+            .ok_or("target has an unterminated '['")?;
+        let port = match rest {
+            "" => None,
+            rest => Some(parse_port(
+                rest.strip_prefix(':')
+                    .ok_or("target must be USER@[HOST]:PORT or USER@HOST:PORT")?,
+            )?),
+        };
+        return Ok((host, port));
+    }
+    match destination.rsplit_once(':') {
+        None => Ok((destination, None)),
+        Some((host, port)) if !host.contains(':') => Ok((host, Some(parse_port(port)?))),
+        // Unbracketed IPv6 literal: all colons belong to the address. A port
+        // on an IPv6 host requires the bracket form.
+        Some(_) => Ok((destination, None)),
+    }
+}
+
+fn parse_port(value: &str) -> Result<u16, Box<dyn std::error::Error>> {
+    match value.parse::<u16>() {
+        Ok(port) if port != 0 => Ok(port),
+        _ => Err("target port must be between 1 and 65535".into()),
+    }
+}
+
 pub fn connect_and_echo(
-    target: &str,
+    target: Target<'_>,
     identity_path: Option<&Path>,
     port_override: Option<u16>,
-    accept_new: bool,
     verbose: u8,
     client_config: &ssxpro_config::ClientConfig,
 ) -> Result<u8, Box<dyn std::error::Error>> {
-    let (user, host) = target.split_once('@').ok_or("target must be USER@HOST")?;
-    if user.is_empty() || host.is_empty() {
-        return Err("target must be USER@HOST".into());
-    }
+    let Target {
+        user,
+        host,
+        port: target_port,
+    } = target;
     let alias = client_config.hosts.get(host);
     let hostname = alias.map_or(host, |entry| {
         if entry.host.is_empty() {
@@ -62,6 +131,7 @@ pub fn connect_and_echo(
         }
     });
     let port = port_override
+        .or(target_port)
         .or_else(|| alias.and_then(|entry| entry.port))
         .unwrap_or(client_config.port);
     let identity = identity_path
@@ -193,11 +263,7 @@ pub fn connect_and_echo(
                 &client_config.known_hosts,
                 &format!("{hostname}:{port}"),
                 &spki,
-                accept_new
-                    || matches!(
-                        client_config.known_hosts_policy,
-                        ssxpro_config::KnownHostsPolicy::AcceptNew
-                    ),
+                client_config.known_hosts_policy,
             )?;
         }
         pin_checked = true;
@@ -717,63 +783,92 @@ fn path_equals(home: &Path, path: &Path) -> bool {
     path == home.join(".ssx/id_ed25519")
 }
 
+fn expand_tilde(home: &Path, path: &Path) -> PathBuf {
+    match path.to_string_lossy().strip_prefix("~/") {
+        Some(rest) => home.join(rest),
+        None => path.to_path_buf(),
+    }
+}
+
+fn read_known_hosts(home: &Path, path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let bytes = if path == home.join(".ssx/known_hosts") {
+        match read_user_file(home, "known_hosts", 1024 * 1024) {
+            Ok(bytes) => bytes,
+            Err(CryptoError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(String::new())
+            }
+            Err(error) => return Err(Box::new(error)),
+        }
+    } else {
+        match read_private_key(path, 1024 * 1024) {
+            Ok(bytes) => bytes,
+            Err(CryptoError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(String::new())
+            }
+            Err(error) => return Err(Box::new(error)),
+        }
+    };
+    Ok(String::from_utf8(bytes)?)
+}
+
+fn prompt_to_trust_host(host: &str, fingerprint: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    eprintln!("The authenticity of host '{host}' cannot be established.");
+    eprintln!("Server key fingerprint: {fingerprint}");
+    loop {
+        eprint!("Allow this host? (Y/n) ");
+        std::io::stderr().flush()?;
+        let mut answer = String::new();
+        if std::io::stdin().read_line(&mut answer)? == 0 {
+            return Ok(false);
+        }
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "" | "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
+            _ => eprintln!("Please answer 'y' or 'n'."),
+        }
+    }
+}
+
 fn check_or_trust_host(
     home: &Path,
     configured_path: &Path,
     host: &str,
     spki: &[u8],
-    accept_new: bool,
+    policy: KnownHostsPolicy,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let known_path = if configured_path.to_string_lossy().starts_with("~/") {
-        home.join(configured_path.to_string_lossy().trim_start_matches("~/"))
-    } else {
-        configured_path.to_path_buf()
-    };
-    let known = if known_path == home.join(".ssx/known_hosts") {
-        match read_user_file(home, "known_hosts", 1024 * 1024) {
-            Ok(bytes) => String::from_utf8(bytes)?,
-            Err(CryptoError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                String::new()
-            }
-            Err(error) => return Err(Box::new(error)),
-        }
-    } else {
-        match read_private_key(&known_path, 1024 * 1024) {
-            Ok(bytes) => String::from_utf8(bytes)?,
-            Err(CryptoError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                String::new()
-            }
-            Err(error) => return Err(Box::new(error)),
-        }
-    };
+    let default_known_path = home.join(".ssx/known_hosts");
+    let known_path = expand_tilde(home, configured_path);
+    let known = read_known_hosts(home, &known_path)?;
     let entries = parse_known_hosts(&known)?;
     match verify_known_host(&entries, host, spki) {
         Ok(()) => Ok(()),
         Err(HostKeyError::Mismatch) => Err(HostKeyError::Mismatch.into()),
         Err(HostKeyError::UnknownHost) => {
+            if known_path != default_known_path {
+                return Err(format!(
+                    "host {host} is not pinned in {}; custom known_hosts files are never modified automatically",
+                    known_path.display()
+                )
+                .into());
+            }
             let fingerprint = fingerprint_spki(spki)?;
-            let accepted = if accept_new {
-                true
-            } else {
-                eprintln!("The authenticity of {host} cannot be established.\nServer key fingerprint: {fingerprint}");
-                eprint!("Trust this host key? (yes/no) ");
-                std::io::stderr().flush()?;
-                let mut answer = String::new();
-                std::io::stdin().read_line(&mut answer)?;
-                answer.trim().eq_ignore_ascii_case("yes")
-            };
-            if !accepted {
-                return Err("host key was not accepted".into());
+            match policy {
+                KnownHostsPolicy::Deny => {
+                    return Err(format!(
+                        "host key for {host} is unknown and known_hosts_policy is deny (fingerprint {fingerprint})"
+                    )
+                    .into())
+                }
+                KnownHostsPolicy::Ask => {
+                    if !prompt_to_trust_host(host, &fingerprint)? {
+                        return Err("host key was not accepted".into());
+                    }
+                }
+                KnownHostsPolicy::Approve => {}
             }
             let hash = sha256(spki)?;
             let line = format!("{host} spki-sha256 {}\n", STANDARD.encode(hash));
-            if known_path == home.join(".ssx/known_hosts") {
-                append_user_file(home, "known_hosts", line.as_bytes(), 1024 * 1024)?;
-            } else {
-                return Err(
-                    "custom known_hosts files must already contain the accepted pin".into(),
-                );
-            }
+            append_user_file(home, "known_hosts", line.as_bytes(), 1024 * 1024)?;
             Ok(())
         }
     }
@@ -821,5 +916,126 @@ fn flush(
             }
             Err(error) => return Err(Box::new(error)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn temp_home(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let home = std::env::temp_dir().join(format!(
+            "ssxpro-client-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&home).unwrap();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        home
+    }
+
+    #[test]
+    fn target_parsing_supports_ports_and_ipv6() {
+        assert_eq!(
+            parse_target("alice@example.test").unwrap(),
+            Target {
+                user: "alice",
+                host: "example.test",
+                port: None,
+            }
+        );
+        assert_eq!(
+            parse_target("alice@example.test:2222").unwrap(),
+            Target {
+                user: "alice",
+                host: "example.test",
+                port: Some(2222),
+            }
+        );
+        assert_eq!(
+            parse_target("alice@[2001:db8::1]:2222").unwrap(),
+            Target {
+                user: "alice",
+                host: "2001:db8::1",
+                port: Some(2222),
+            }
+        );
+        assert_eq!(
+            parse_target("alice@2001:db8::1").unwrap(),
+            Target {
+                user: "alice",
+                host: "2001:db8::1",
+                port: None,
+            }
+        );
+        for target in [
+            "example.test",
+            "alice@",
+            "@example.test",
+            "alice@example.test:0",
+            "alice@example.test:notaport",
+            "alice@[2001:db8::1",
+            "alice@[2001:db8::1]suffix",
+            "alice@exa mple.test:22",
+        ] {
+            assert!(
+                parse_target(target).is_err(),
+                "{target:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn approve_policy_creates_secure_default_known_hosts() {
+        let home = temp_home("known-hosts");
+        let key = Ed25519Keypair::from_seed([9; 32]).unwrap();
+        let spki = key.public_key().to_spki_der();
+        let configured = Path::new("~/.ssx/known_hosts");
+
+        check_or_trust_host(
+            &home,
+            configured,
+            "example.test:22",
+            &spki,
+            KnownHostsPolicy::Approve,
+        )
+        .expect("approve policy saves an unknown host");
+        let path = home.join(".ssx/known_hosts");
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.starts_with("example.test:22 spki-sha256 "));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(home.join(".ssx"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+
+        check_or_trust_host(
+            &home,
+            configured,
+            "example.test:22",
+            &spki,
+            KnownHostsPolicy::Deny,
+        )
+        .expect("the saved pin is accepted under deny");
+        assert!(check_or_trust_host(
+            &home,
+            configured,
+            "other.test:22",
+            &spki,
+            KnownHostsPolicy::Deny,
+        )
+        .is_err());
+        std::fs::remove_dir_all(home).unwrap();
     }
 }

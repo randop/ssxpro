@@ -11,13 +11,13 @@ The script drives the client over a real PTY and verifies:
 Prerequisites
 -------------
 * A built client at ``target/debug/ssx`` (or set ``SSX_BIN``).
-* A locally running ``ssxd`` (e.g. ``ssxd --skip-config-permissions -v``)
+* A locally running ``ssxd`` (e.g. ``ssxd --yes-I-know-permission-risks-go-ahead-please -v``)
   bound to ``SSX_E2E_HOST:SSX_E2E_PORT`` (default 127.0.0.1:2222).
 * The user's key at ``SSX_E2E_IDENTITY`` (default ``~/.ssx/id_ed25519``)
   is listed in the server-side ``authorized_keys``.
 * The server's key pin exists at ``SSX_E2E_KNOWN_HOSTS``
-  (default ``~/.ssx/known_hosts``); connect once with ``--accept-new``
-  or the default client config to create it.
+  (default ``~/.ssx/known_hosts``); connect once with
+  ``--approve-host`` or the default client config to create it.
 
 The test does not start or stop servers; it only drives clients. All artifacts
 are written under ``target/e2e`` unless ``SSX_E2E_WORK`` is set.
@@ -64,7 +64,7 @@ port: {port}
 connect_timeout_secs: 10
 handshake_timeout_secs: 15
 known_hosts: "{known_hosts}"
-known_hosts_policy: "reject"
+known_hosts_policy: "deny"
 """
 
 
@@ -88,7 +88,7 @@ def host_pin():
             return line + "\n"
     print(
         f"missing pin for {target} in {KNOWN_HOSTS_SOURCE}; connect once with "
-        "--accept-new (or known_hosts_policy accept-new) to create it",
+        "--approve-host (or known_hosts_policy approve) to create it",
         file=sys.stderr,
     )
     sys.exit(2)

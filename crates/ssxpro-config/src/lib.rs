@@ -532,7 +532,7 @@ impl Default for ClientConfig {
             server_alive_interval_secs: default_server_alive_interval(),
             server_alive_count_max: default_server_alive_count_max(),
             known_hosts: default_known_hosts(),
-            known_hosts_policy: KnownHostsPolicy::Reject,
+            known_hosts_policy: KnownHostsPolicy::Ask,
         }
     }
 }
@@ -544,12 +544,16 @@ pub struct HostAlias {
     pub port: Option<u16>,
     pub identity: Option<PathBuf>,
 }
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum KnownHostsPolicy {
+    /// Reject connections to hosts that are not already pinned.
+    Deny,
+    /// Prompt before accepting an unknown host key.
     #[default]
-    Reject,
-    AcceptNew,
+    Ask,
+    /// Accept and save an unknown host key without prompting.
+    Approve,
 }
 
 impl ClientConfig {
@@ -645,7 +649,7 @@ pub fn default_client_config_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_client_yaml, parse_server_yaml};
+    use super::{parse_client_yaml, parse_server_yaml, KnownHostsPolicy};
 
     #[test]
     fn features_default_individually_and_reject_typos() {
@@ -735,6 +739,23 @@ mod tests {
         let error = parse_server_yaml("quic:\n  keep_alive_interval_secs: 99999\n")
             .expect_err("oversize keepalive interval is rejected");
         assert!(error.message.contains("quic.keep_alive_interval_secs"));
+    }
+
+    #[test]
+    fn client_known_hosts_policy_defaults_to_ask() {
+        let client = parse_client_yaml("").expect("empty client config uses defaults");
+        assert_eq!(client.known_hosts_policy, KnownHostsPolicy::Ask);
+
+        let client = parse_client_yaml("known_hosts_policy: deny\n").expect("deny policy accepted");
+        assert_eq!(client.known_hosts_policy, KnownHostsPolicy::Deny);
+        let client = parse_client_yaml("known_hosts_policy: ask\n").expect("ask policy accepted");
+        assert_eq!(client.known_hosts_policy, KnownHostsPolicy::Ask);
+        let client =
+            parse_client_yaml("known_hosts_policy: approve\n").expect("approve policy accepted");
+        assert_eq!(client.known_hosts_policy, KnownHostsPolicy::Approve);
+
+        assert!(parse_client_yaml("known_hosts_policy: reject\n").is_err());
+        assert!(parse_client_yaml("known_hosts_policy: accept-new\n").is_err());
     }
 
     #[test]

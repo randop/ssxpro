@@ -359,7 +359,7 @@ pub fn spawn_login_session(
     // SAFETY: geteuid/getegid have no arguments and no side effects.
     let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
     // The broker normally runs as root and drops to the target identity here.
-    // Unprivileged development mode (ssxd --skip-config-permissions) may run
+    // Unprivileged development mode (ssxd --yes-I-know-permission-risks-go-ahead-please) may run
     // the broker directly as the target account; privilege dropping is then
     // both impossible (no CAP_SETGID/SETUID) and unnecessary. Any other
     // unprivileged identity mismatch fails closed.

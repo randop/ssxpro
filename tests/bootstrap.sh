@@ -6,7 +6,7 @@
 # artifact the driver expects from its environment (host key, test
 # identity, authorized_keys, known_hosts pin, ssxd.yaml), validates the
 # configuration and kernel with `ssxd --check-config`, starts
-# `ssxd --skip-config-permissions` in the background, and waits until
+# `ssxd --yes-I-know-permission-risks-go-ahead-please` in the background, and waits until
 # the server reports ready.
 #
 # Usage:
@@ -326,7 +326,7 @@ write_keys() {
 preflight_check_config() {
     local code=0
     # shellcheck disable=SC2086 # SSXD_VERBOSE is an intentional word list
-    "$SSXD_BIN" --config "$SSXD_CONFIG" --skip-config-permissions \
+    "$SSXD_BIN" --config "$SSXD_CONFIG" --yes-I-know-permission-risks-go-ahead-please \
         $SSXD_VERBOSE --check-config > "$SSXD_CHECK_LOG" 2>&1 || code=$?
     if [ "$code" -ne 0 ]; then
         cat "$SSXD_CHECK_LOG" >&2 || true
@@ -420,10 +420,10 @@ start_server() {
     # in plain start mode and the whole group can be signalled on stop.
     # shellcheck disable=SC2086 # SSXD_VERBOSE/SSXD_EXTRA_ARGS are word lists
     if command -v setsid >/dev/null 2>&1; then
-        setsid "$SSXD_BIN" --config "$SSXD_CONFIG" --skip-config-permissions \
+        setsid "$SSXD_BIN" --config "$SSXD_CONFIG" --yes-I-know-permission-risks-go-ahead-please \
             $SSXD_VERBOSE $SSXD_EXTRA_ARGS >> "$SSXD_LOG" 2>&1 < /dev/null &
     else
-        "$SSXD_BIN" --config "$SSXD_CONFIG" --skip-config-permissions \
+        "$SSXD_BIN" --config "$SSXD_CONFIG" --yes-I-know-permission-risks-go-ahead-please \
             $SSXD_VERBOSE $SSXD_EXTRA_ARGS >> "$SSXD_LOG" 2>&1 < /dev/null &
     fi
     SSXD_PID=$!
