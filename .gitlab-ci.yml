@@ -112,6 +112,7 @@ build:armhf:
       g++-arm-linux-gnueabihf
       binutils-arm-linux-gnueabihf
       libc6-dev-armhf-cross
+      linux-libc-dev-armhf-cross
 
     - rm -rf /var/lib/apt/lists/*
 
@@ -121,6 +122,7 @@ build:armhf:
     - arm-linux-gnueabihf-gcc --version
     - test -f /usr/arm-linux-gnueabihf/lib/libc.so.6
     - test -f /usr/arm-linux-gnueabihf/lib/ld-linux-armhf.so.3
+    - test -f /usr/arm-linux-gnueabihf/include/linux/io_uring.h
 
   script:
     - cargo tree -e features -i io-uring --target armv7-unknown-linux-gnueabihf
