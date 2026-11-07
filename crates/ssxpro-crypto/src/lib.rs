@@ -534,7 +534,7 @@ fn read_strict_file(
     let path_c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
         .map_err(|_| CryptoError::InvalidFormat("file path contains NUL"))?;
     let how = OpenHow {
-        flags: (libc::O_RDONLY | libc::O_CLOEXEC) as u64,
+        flags: (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK) as u64,
         mode: 0,
         resolve: RESOLVE_NO_SYMLINKS,
     };
@@ -554,6 +554,9 @@ fn read_strict_file(
     // SAFETY: openat2 returned a new owned file descriptor.
     let file = unsafe { std::fs::File::from_raw_fd(fd) };
     let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(CryptoError::InvalidFormat("not a regular file"));
+    }
     if enforce_permissions {
         check_file_metadata(path, &metadata, 0o600)?;
     }
@@ -620,7 +623,7 @@ fn open_user_dirs_impl(
             }
         }
     }
-    let secure_file = openat2_file(
+    let secure_file = openat2_entry(
         home_file.as_raw_fd(),
         ".ssx",
         (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
@@ -641,12 +644,26 @@ fn openat2_file(
     mode: u64,
     resolve: u64,
 ) -> CryptoResult<std::fs::File> {
+    let file = openat2_entry(dir_fd, name, flags, mode, resolve)?;
+    if !file.metadata()?.is_file() {
+        return Err(CryptoError::InvalidFormat("not a regular file"));
+    }
+    Ok(file)
+}
+
+fn openat2_entry(
+    dir_fd: libc::c_int,
+    name: &str,
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+) -> CryptoResult<std::fs::File> {
     use std::os::fd::FromRawFd;
     use std::os::unix::ffi::OsStrExt;
     let name_c = std::ffi::CString::new(std::ffi::OsStr::new(name).as_bytes())
         .map_err(|_| CryptoError::InvalidFormat("file name contains NUL"))?;
     let how = OpenHow {
-        flags,
+        flags: flags | libc::O_NONBLOCK as u64,
         mode,
         resolve,
     };
@@ -842,6 +859,33 @@ mod tests {
         symlink(&outside, home.join(".ssx/key")).unwrap();
         assert!(read_user_file(&home, "key", 16).is_err());
         std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn file_reads_reject_fifos_even_without_permission_checks() {
+        let dir = std::env::temp_dir().join(format!("ssxpro-fifo-test-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("fifo");
+        let path_c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: path_c is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(path_c.as_ptr(), 0o600) }, 0);
+        for enforce_permissions in [false, true] {
+            assert!(matches!(
+                read_strict_file(&path, 16, "too large", enforce_permissions),
+                Err(CryptoError::InvalidFormat("not a regular file"))
+            ));
+        }
+        assert!(matches!(
+            openat2_file(
+                libc::AT_FDCWD,
+                path.to_str().unwrap(),
+                libc::O_RDONLY as u64,
+                0,
+                RESOLVE_NO_SYMLINKS
+            ),
+            Err(CryptoError::InvalidFormat("not a regular file"))
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

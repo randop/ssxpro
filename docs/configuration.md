@@ -72,7 +72,13 @@ known_hosts: /home/alice/.ssx/known_hosts
 known_hosts_policy: ask
 ```
 
-Client `known_hosts_policy` is `deny`, `ask` (default), or `approve`. `deny` rejects a host that is not already pinned; `ask` prints the server key fingerprint and prompts `Allow this host? (Y/n)`, defaulting to yes; `approve` saves an unknown host key without prompting. A changed host key is always a fatal error. Accepted keys are appended to the secure default `~/.ssx/known_hosts` (directory mode `0700`, file mode `0600`); a custom `known_hosts` path must already contain the pin. `--approve-host` automatically approves and saves an unknown host key for one connection, overriding the configured policy.
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:dd63097dae93d7fab181d23d2c94983e0f70671d580ab17d4764f8ec5df2755c -->
+
+Client `known_hosts_policy` is `deny`, `ask` (default), or `approve`. `deny` rejects a host that is not already pinned; `ask` prints the server key fingerprint and prompts `Allow this host? (y/N)`, accepting only an explicit `y` or `yes`; `approve` saves an unknown host key without prompting. A changed host key is always a fatal error. Accepted keys are appended to the secure default `~/.ssx/known_hosts` (directory mode `0700`, file mode `0600`); a custom `known_hosts` path must already contain the pin. `--approve-host` automatically approves and saves an unknown host key for one connection, overriding the configured policy.
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 The target is `USER@HOST[:PORT]` or a configured host alias. Bracket an IPv6 literal when supplying a port, for example `alice@[2001:db8::1]:2222`. A port in the target overrides an alias or config port; `--port` overrides both. Host aliases require a nonempty host. Alias fields inherit global port and identity when omitted.
 

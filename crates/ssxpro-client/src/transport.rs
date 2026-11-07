@@ -815,15 +815,15 @@ fn prompt_to_trust_host(host: &str, fingerprint: &str) -> Result<bool, Box<dyn s
     eprintln!("The authenticity of host '{host}' cannot be established.");
     eprintln!("Server key fingerprint: {fingerprint}");
     loop {
-        eprint!("Allow this host? (Y/n) ");
+        eprint!("Allow this host? (y/N) ");
         std::io::stderr().flush()?;
         let mut answer = String::new();
         if std::io::stdin().read_line(&mut answer)? == 0 {
             return Ok(false);
         }
         match answer.trim().to_ascii_lowercase().as_str() {
-            "" | "y" | "yes" => return Ok(true),
-            "n" | "no" => return Ok(false),
+            "y" | "yes" => return Ok(true),
+            "" | "n" | "no" => return Ok(false),
             _ => eprintln!("Please answer 'y' or 'n'."),
         }
     }
