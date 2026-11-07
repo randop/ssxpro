@@ -123,6 +123,7 @@ build:armhf:
     - test -f /usr/arm-linux-gnueabihf/lib/ld-linux-armhf.so.3
 
   script:
+    - cargo tree -e features -i io-uring --target armv7-unknown-linux-gnueabihf
     - cargo build --release --target armv7-unknown-linux-gnueabihf
 
   artifacts:
