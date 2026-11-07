@@ -1,0 +1,14 @@
+hosts:
+  home:
+    host: "shell.example.com"
+    port: 2222
+    identity: "~/.ssx/home_ed25519"
+identity: "~/.ssx/id_ed25519"
+port: 22
+connect_timeout_secs: 10
+handshake_timeout_secs: 15
+idle_timeout_secs: 600
+server_alive_interval_secs: 15
+server_alive_count_max: 6
+known_hosts: "~/.ssx/known_hosts"
+known_hosts_policy: "ask"

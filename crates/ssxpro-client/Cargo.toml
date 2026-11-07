@@ -1,0 +1,26 @@
+[package]
+name = "ssxpro-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "ssx"
+path = "src/main.rs"
+
+[dependencies]
+ssxpro-proto = { path = "../ssxpro-proto" }
+ssxpro-crypto = { path = "../ssxpro-crypto" }
+ssxpro-io = { path = "../ssxpro-io" }
+ssxpro-config = { path = "../ssxpro-config" }
+clap.workspace = true
+base64.workspace = true
+libc.workspace = true
+quiche = { version = "=0.30.0", default-features = true }
+boring.workspace = true
+io-uring.workspace = true
+boring-sys = "=4.22.0"
+
+[lints]
+workspace = true

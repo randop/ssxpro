@@ -1,0 +1,18 @@
+[package]
+name = "ssxpro-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+base64.workspace = true
+boring.workspace = true
+libc.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true
