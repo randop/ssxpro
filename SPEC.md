@@ -17,6 +17,10 @@ The client negotiates ALPN `ssxpro/1`. Stream 0 is the bidirectional control str
 
 Control frames are `type` followed by `length` followed by `payload`. `type` is a QUIC varint; `length` is an unsigned big-endian 16-bit byte count. The payload is at most 4096 bytes. Integers in payloads are unsigned big-endian unless stated otherwise. Strings are UTF-8, nonempty where required, and contain no NUL. Decoders reject trailing bytes, invalid UTF-8, noncanonical/overflowing integer encodings, unknown message types, and lengths above the bound. A frame is not acted on until its full declared payload has arrived.
 
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:f27873c5831c54ba43fcfdd32b555f28208c18f69950dc9c0ba5902665da1380 -->
+
 | Type | Direction | Payload |
 |---|---|---|
 | 0x00 `Hello` | client→server | version u16 (=1), feature bits u32 (unknown bits rejected) |
@@ -26,13 +30,15 @@ Control frames are `type` followed by `length` followed by `payload`. `type` is 
 | 0x04 `AuthFail` | server→client | reason class u8; classes are `denied`=1 and `temporarily_unavailable`=2 |
 | 0x05 `OpenShell` | client→server | terminal name (u16 length + UTF-8, max 64), rows u16, columns u16 |
 | 0x06 `Resize` | client→server | rows u16, columns u16 |
-| 0x07 `Signal` | client→server | signal u8: HUP=1, INT=2, QUIT=3, TERM=4, TSTP=5, WINCH=6 |
+| 0x07 `Signal` | client→server | signal u8: HUP=1, INT=2, QUIT=3, TERM=4, KILL=5, TSTP=6, CONT=7, WINCH=8 |
 | 0x08 `Exit` | server→client | kind u8 (status=0 or signal=1), value u8 |
 | 0x09 `Close` | either | application code u16 |
 
-Dimensions must be in 1..=65535. Terminal names are limited to 64 bytes. Username is limited to 256 bytes. Control message-specific exact payload lengths are mandatory. `Exit` status is 0..=255; signal values use the same allowlist as `Signal`. Close codes are 0 normal, 1 protocol error, 2 authentication failed, 3 resource limit, 4 internal error. The peer receives only the coarse `AuthFail` class; details are logged locally by the monitor.
+Dimensions must be in 1..=4096. Terminal names are limited to 64 bytes. Username is limited to 256 bytes. Control message-specific exact payload lengths are mandatory. `Exit` status is 0..=255; signal values are native Linux signal numbers in 1..=64 (including signals outside the `Signal` control allowlist), as reported by `waitid`. These differ from control-message codes. Close codes are 0 normal, 1 protocol error, 2 authentication failed, 3 resource limit, 4 internal error. The peer receives only the coarse `AuthFail` class; details are logged locally by the monitor.
 
 ## Client state machine
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 `Hello → Auth → Open → Running → Exit`:
 

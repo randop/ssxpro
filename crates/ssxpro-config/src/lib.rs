@@ -108,7 +108,9 @@ fn default_host_key() -> PathBuf {
     PathBuf::from("/etc/ssx/host_ed25519")
 }
 fn default_workers() -> usize {
-    std::thread::available_parallelism().map_or(1, usize::from)
+    std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .clamp(1, 256)
 }
 fn default_ring_entries() -> u32 {
     4096

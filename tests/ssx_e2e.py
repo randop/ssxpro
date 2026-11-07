@@ -246,7 +246,7 @@ def main():
             [
                 # The client opens stream 4 itself; the prompt must appear
                 # without the user typing anything.
-                (None, b"printf 'SSX_%s\\n' READY\r"),
+                ("terminal raw mode enabled", b"printf 'SSX_%s\\n' READY\r"),
                 ("SSX_READY", b"uname -s\r"),
                 ("Linux", b"printf 'MARK_%s\\n' 42\r"),
                 ("MARK_42", b"exit\r"),
@@ -260,7 +260,7 @@ def main():
         run_scenario(
             "B-remote-exit-status",
             base,
-            [(None, b"printf 'SSX_%s\\n' READY\r"), ("SSX_READY", b"exit 7\r")],
+            [("terminal raw mode enabled", b"printf 'SSX_%s\\n' READY\r"), ("SSX_READY", b"exit 7\r")],
             expect_status=7,
             expect_output=("kind=Status, value=7",),
         )
@@ -286,7 +286,7 @@ def main():
             [
                 # After shell readiness, the session must survive a quiet period longer
                 # than the client idle timeout thanks to keepalive pings.
-                (None, b"printf 'SSX_%s\\n' READY\r"),
+                ("terminal raw mode enabled", b"printf 'SSX_%s\\n' READY\r"),
                 ("SSX_READY", None),
                 15,
                 (None, b"printf 'IDLE_%s\\n' ok\r"),

@@ -114,6 +114,7 @@ pub fn lookup_login_identity(name: &str, permit_root: bool) -> Result<LoginIdent
     {
         return Err(SessionError::Io(io::Error::last_os_error()));
     }
+    supplementary_groups.truncate(group_count.max(0) as usize);
     if passwd.pw_uid == 0 && !permit_root {
         return Err(SessionError::Policy("root login is disabled"));
     }
@@ -244,6 +245,13 @@ impl SpawnedSession {
         } else {
             ssxpro_proto::ExitKind::Signal
         };
+        // Exit signals use native Linux numbers, independently of Signal controls.
+        if kind == ssxpro_proto::ExitKind::Signal && !(1..=64).contains(&status) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid child exit signal",
+            ));
+        }
         Ok(Some((kind, status.clamp(0, 255) as u8)))
     }
 }
@@ -382,12 +390,6 @@ pub fn spawn_login_session(
             if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) < 0 {
                 return Err(io::Error::last_os_error());
             }
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGHUP, 0, 0, 0) < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            if libc::getppid() != expected_parent {
-                return Err(io::Error::from_raw_os_error(libc::ECANCELED));
-            }
             if drop_privileges {
                 if libc::setgroups(groups.len(), groups.as_ptr()) < 0
                     || libc::setresgid(gid, gid, gid) < 0
@@ -397,6 +399,12 @@ pub fn spawn_login_session(
                 }
             } else if !already_target {
                 return Err(io::Error::from_raw_os_error(libc::EPERM));
+            }
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGHUP, 0, 0, 0) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::getppid() != expected_parent {
+                return Err(io::Error::from_raw_os_error(libc::ECANCELED));
             }
             if libc::chdir(home.as_ptr()) < 0
                 || libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0

@@ -707,6 +707,9 @@ pub fn encode_broker_exit(
     value: u8,
     output: &mut [u8],
 ) -> Result<usize, MonitorFrameError> {
+    if !valid_exit(kind, value) {
+        return Err(MonitorFrameError::UnknownType);
+    }
     let length = 1 + 8 + 1 + 1;
     if output.len() < length {
         return Err(MonitorFrameError::Truncated);
@@ -755,6 +758,9 @@ pub fn decode_broker_response(frame: &[u8]) -> Result<BrokerResponse, MonitorFra
                 1 => ExitKind::Signal,
                 _ => return Err(MonitorFrameError::UnknownType),
             };
+            if !valid_exit(kind, frame[10]) {
+                return Err(MonitorFrameError::UnknownType);
+            }
             Ok(BrokerResponse::Exit {
                 session_id,
                 kind,
@@ -908,7 +914,8 @@ pub fn encode(message: &Message, out: &mut [u8; MAX_WIRE_FRAME]) -> Result<usize
         Message::Resize { rows, cols } if valid_window(*rows, *cols) => (6, 4),
         Message::Resize { .. } => return Err(ProtocolError::InvalidPayload),
         Message::Signal { .. } => (7, 1),
-        Message::Exit { .. } => (8, 2),
+        Message::Exit { kind, value } if valid_exit(*kind, *value) => (8, 2),
+        Message::Exit { .. } => return Err(ProtocolError::InvalidPayload),
         Message::Close { .. } => (9, 2),
     };
     if payload_len > MAX_FRAME {
@@ -1060,7 +1067,7 @@ pub fn decode(input: &[u8]) -> Result<(Message, usize), ProtocolError> {
                 _ => return Err(ProtocolError::InvalidPayload),
             },
         },
-        8 if len == 2 => Message::Exit {
+        8 if len == 2 && (p[0] == 0 || (p[0] == 1 && (1..=64).contains(&p[1]))) => Message::Exit {
             kind: match p[0] {
                 0 => ExitKind::Status,
                 1 => ExitKind::Signal,
@@ -1086,6 +1093,10 @@ fn valid_user(user: &[u8]) -> bool {
 
 fn valid_term(term: &[u8]) -> bool {
     term.iter().all(|byte| (0x20..=0x7e).contains(byte))
+}
+
+fn valid_exit(kind: ExitKind, value: u8) -> bool {
+    kind == ExitKind::Status || (1..=64).contains(&value)
 }
 
 fn valid_window(rows: u16, cols: u16) -> bool {
@@ -1466,5 +1477,54 @@ mod tests {
             })
             .unwrap();
         assert_eq!(state, ClientState::Running);
+    }
+
+    #[test]
+    fn wire_contract_boundaries() {
+        let mut out = [0u8; MAX_WIRE_FRAME];
+        for value in [1, 9, 15, 64] {
+            let message = Message::Exit {
+                kind: ExitKind::Signal,
+                value,
+            };
+            let length = encode(&message, &mut out).unwrap();
+            assert_eq!(decode(&out[..length]).unwrap().0, message);
+        }
+        for value in [0, 65, 255] {
+            assert!(encode(
+                &Message::Exit {
+                    kind: ExitKind::Signal,
+                    value
+                },
+                &mut out
+            )
+            .is_err());
+            assert!(decode(&[8, 0, 2, 1, value]).is_err());
+        }
+        assert!(encode(
+            &Message::Resize {
+                rows: 4096,
+                cols: 4096
+            },
+            &mut out
+        )
+        .is_ok());
+        assert!(encode(
+            &Message::Resize {
+                rows: 4097,
+                cols: 1
+            },
+            &mut out
+        )
+        .is_err());
+        for (signal, code) in [
+            (Signal::Kill, 5),
+            (Signal::Tstp, 6),
+            (Signal::Cont, 7),
+            (Signal::Winch, 8),
+        ] {
+            let length = encode(&Message::Signal { signal }, &mut out).unwrap();
+            assert_eq!(&out[..length], &[7, 0, 1, code]);
+        }
     }
 }

@@ -205,7 +205,15 @@ fn run_broker(
         for (index, slot) in channels.iter_mut().enumerate() {
             let mut closed = false;
             while let Some(channel) = slot.as_ref() {
-                match channel.recv(&mut buffer)? {
+                let event = match channel.recv(&mut buffer) {
+                    Ok(event) => event,
+                    Err(error) => {
+                        eprintln!("ssxd: closing failed broker channel: {error}");
+                        closed = true;
+                        break;
+                    }
+                };
+                match event {
                     ChannelEvent::Empty => break,
                     ChannelEvent::Closed => {
                         closed = true;
@@ -213,7 +221,7 @@ fn run_broker(
                     }
                     ChannelEvent::Message(message) => {
                         did_work = true;
-                        handle_message(
+                        if let Err(error) = handle_message(
                             index,
                             channel,
                             message,
@@ -221,7 +229,11 @@ fn run_broker(
                             &mut sessions,
                             &mut used_tokens,
                             &mut next_session_id,
-                        )?;
+                        ) {
+                            eprintln!("ssxd: closing invalid broker channel: {error}");
+                            closed = true;
+                            break;
+                        }
                     }
                 }
             }
@@ -259,7 +271,8 @@ fn run_broker(
                     let _ = session.process.kill_group();
                     if let Some(channel) = channels[session.worker_index].as_ref() {
                         let mut frame = [0u8; MAX_BROKER_FRAME];
-                        let length = encode_broker_exit(*session_id, kind, value, &mut frame)?;
+                        let length = encode_broker_exit(*session_id, kind, value, &mut frame)
+                            .expect("valid child exit status");
                         // A closed worker means nobody will consume the status;
                         // the session is reaped and dropped either way.
                         let _ = channel.send(&frame[..length], &[]);
@@ -296,7 +309,12 @@ fn run_broker(
             match ring.wait_timeout(BROKER_POLL_INTERVAL) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(Box::new(error)),
+                Err(error) => {
+                    for session in sessions.values() {
+                        let _ = session.process.kill_group();
+                    }
+                    return Err(Box::new(error));
+                }
             }
         }
     }

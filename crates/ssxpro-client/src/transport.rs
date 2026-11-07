@@ -336,6 +336,7 @@ pub fn connect_and_echo(
         return Err("ssx requires a terminal on stdin".into());
     }
     let mut raw_mode = RawMode::enter(libc::STDIN_FILENO)?;
+    debug1!(verbose, "terminal raw mode enabled");
     let (input_rx, _input_thread) = start_input_reader()?;
     let mut escapes = EscapeDecoder::default();
     let mut input_pending = VecDeque::new();
@@ -696,6 +697,12 @@ fn ring_write_all(ring: &mut RuntimeRing, fd: RawFd, mut bytes: &[u8]) -> std::i
 }
 
 fn load_identity(home: &Path, path: &Path) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    let expanded = path
+        .as_os_str()
+        .as_encoded_bytes()
+        .starts_with(b"~/")
+        .then(|| home.join(path.strip_prefix("~").expect("tilde path prefix")));
+    let path = expanded.as_deref().unwrap_or(path);
     let data = if path_equals(home, path) {
         read_user_file(home, "id_ed25519", 256)?
     } else {

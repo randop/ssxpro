@@ -11,6 +11,17 @@ case "$expected" in
     esac
     ;;
   stable)
+    stable_release=${2:?expected stable release (major.minor.patch) required}
+    case "$stable_release" in
+      *[!0-9.]*|.*|*.|*..*) echo "invalid stable release: $stable_release" >&2; exit 2 ;;
+    esac
+    if [ "$(printf '%s' "$stable_release" | awk -F. '{print NF}')" -ne 3 ]; then
+      echo "expected major.minor.patch: $stable_release" >&2; exit 2
+    fi
+    case "$release" in
+      "$stable_release"|"$stable_release"-*) ;;
+      *) echo "expected Linux $stable_release, found $release" >&2; exit 1 ;;
+    esac
     major=$(printf '%s' "$release" | cut -d. -f1)
     minor=$(printf '%s' "$release" | cut -d. -f2)
     if [ "$major" -lt 6 ] || { [ "$major" -eq 6 ] && [ "$minor" -lt 12 ]; }; then

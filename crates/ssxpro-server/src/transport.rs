@@ -146,7 +146,14 @@ impl InitialRateLimiter {
             .retain(|_, (started, _)| now.duration_since(*started) < Duration::from_secs(10));
         let Some((started, count)) = self.sources.get_mut(&source) else {
             if self.sources.len() >= 4096 {
-                return false;
+                if let Some(oldest) = self
+                    .sources
+                    .iter()
+                    .min_by_key(|(_, (at, _))| *at)
+                    .map(|(ip, _)| *ip)
+                {
+                    self.sources.remove(&oldest);
+                }
             }
             self.sources.insert(source, (now, 1));
             return true;
@@ -637,16 +644,17 @@ fn serve_worker(
                     {
                         continue;
                     }
-                    if !initial_rate_limiter
-                        .lock()
-                        .map_err(|_| "initial rate limiter lock poisoned")?
-                        .allow(peer.ip())
-                    {
-                        continue;
-                    }
                     if config.quic.retry {
                         let token = header.token.as_deref().unwrap_or_default();
                         if token.is_empty() {
+                            if !initial_rate_limiter
+                                .lock()
+                                .map_err(|_| "initial rate limiter lock poisoned")?
+                                .allow(peer.ip())
+                            {
+                                continue;
+                            }
+
                             let token = mint_retry_token(&retry_secret, &peer, &datagram_dcid)?;
                             debug2!(verbose, "sent QUIC retry to {} (new connection)", peer.ip());
                             let mut retry_scid_bytes = [0u8; quiche::MAX_CONN_ID_LEN];
@@ -672,6 +680,15 @@ fn serve_worker(
                             continue;
                         }
                         if validate_retry_token(&retry_secret, &peer, token).is_none() {
+                            continue;
+                        }
+                    }
+                    if !config.quic.retry {
+                        if !initial_rate_limiter
+                            .lock()
+                            .map_err(|_| "initial rate limiter lock poisoned")?
+                            .allow(peer.ip())
+                        {
                             continue;
                         }
                     }
@@ -1703,6 +1720,16 @@ fn flush_quic(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn initial_limiter_full_table_admits_new_source() {
+        let mut limiter = super::InitialRateLimiter::new();
+        for ip in 0..4096u32 {
+            assert!(limiter.allow(std::net::IpAddr::V4(ip.into())));
+        }
+        assert!(limiter.allow(std::net::IpAddr::V4(5000u32.into())));
+        assert_eq!(limiter.sources.len(), 4096);
+    }
+
     use super::{mint_retry_token, validate_retry_token};
     use std::net::SocketAddr;
 

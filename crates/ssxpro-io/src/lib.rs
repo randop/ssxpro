@@ -18,6 +18,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 pub struct RuntimeRing {
     inner: io_uring::IoUring,
     fixed_files: Vec<Option<RawFd>>,
+    next_token: u64,
+    completions: VecDeque<(u64, i32)>,
 }
 
 const FIXED_FILE_SLOTS: usize = 32;
@@ -81,6 +83,8 @@ impl RuntimeRing {
         Ok(Self {
             inner: ring,
             fixed_files: vec![None; fixed_file_slots],
+            next_token: 1,
+            completions: VecDeque::new(),
         })
     }
 
@@ -145,25 +149,50 @@ impl RuntimeRing {
     /// Submit one operation and wait for its CQE. All backing memory must remain
     /// valid until this returns; callers can therefore use stack-backed msghdrs.
     pub fn submit_wait(&mut self, entry: &io_uring::squeue::Entry) -> std::io::Result<i32> {
+        let token = self.token();
+        let entry = entry.clone().user_data(token);
         {
             let mut queue = self.inner.submission();
             // SAFETY: submit_wait does not return until this SQE has a completion,
             // and the caller keeps all SQE-referenced memory alive for this call.
             unsafe {
                 queue
-                    .push(entry)
+                    .push(&entry)
                     .map_err(|_| std::io::Error::other("submission queue is full"))?;
             }
         }
-        self.inner.submit_and_wait(1)?;
-        let mut queue = self.inner.completion();
-        let cqe = queue
-            .next()
-            .ok_or_else(|| std::io::Error::other("io_uring returned without a CQE"))?;
-        if cqe.result() < 0 {
-            return Err(std::io::Error::from_raw_os_error(-cqe.result()));
+        let result = self.wait_completion(token);
+        if result < 0 {
+            return Err(std::io::Error::from_raw_os_error(-result));
         }
-        Ok(cqe.result())
+        Ok(result)
+    }
+
+    fn token(&mut self) -> u64 {
+        let token = self.next_token;
+        self.next_token = token
+            .checked_add(1)
+            .expect("io_uring token space exhausted");
+        token
+    }
+
+    fn wait_completion(&mut self, token: u64) -> i32 {
+        loop {
+            if let Some(index) = self.completions.iter().position(|(id, _)| *id == token) {
+                return self.completions.remove(index).unwrap().1;
+            }
+            match self.inner.submit_and_wait(1) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                // An unrecoverable ring failure cannot release kernel-owned buffers.
+                Err(_) => std::process::abort(),
+            }
+            self.completions.extend(
+                self.inner
+                    .completion()
+                    .map(|cqe| (cqe.user_data(), cqe.result())),
+            );
+        }
     }
 
     /// Complete both linked operations before releasing either backing buffer.
@@ -173,38 +202,24 @@ impl RuntimeRing {
         timeout: std::time::Duration,
     ) -> std::io::Result<i32> {
         let timespec = io_uring::types::Timespec::from(timeout);
+        let operation_token = self.token();
+        let timer_token = self.token();
         let operation = entry
             .clone()
             .flags(io_uring::squeue::Flags::FIXED_FILE | io_uring::squeue::Flags::IO_LINK)
-            .user_data(1);
+            .user_data(operation_token);
         let timer = io_uring::opcode::LinkTimeout::new(&timespec)
             .build()
-            .user_data(2);
+            .user_data(timer_token);
         unsafe {
             self.inner
                 .submission()
                 .push_multiple(&[operation, timer])
                 .map_err(|_| std::io::Error::other("submission queue is full"))?;
         }
-        let mut result = None;
-        let mut timer_result = None;
-        while result.is_none() || timer_result.is_none() {
-            match self.inner.submit_and_wait(1) {
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                // Returning would free memory the kernel may still reference.
-                Err(_) => std::process::abort(),
-            }
-            for cqe in self.inner.completion() {
-                match cqe.user_data() {
-                    1 => result = Some(cqe.result()),
-                    2 => timer_result = Some(cqe.result()),
-                    _ => std::process::abort(),
-                }
-            }
-        }
-        let result = result.unwrap();
-        if result == -libc::ECANCELED && timer_result == Some(-libc::ETIME) {
+        let result = self.wait_completion(operation_token);
+        let timer_result = self.wait_completion(timer_token);
+        if result == -libc::ECANCELED && timer_result == -libc::ETIME {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "operation timed out",
@@ -226,10 +241,6 @@ impl RuntimeRing {
         match self.submit_wait(&entry) {
             Ok(_) => Ok(()),
             Err(error) if error.raw_os_error() == Some(libc::ETIME) => Ok(()),
-            // A spurious wakeup can leave the completion queue empty even though
-            // `submit_and_wait` reported success. Treat that as a timeout and
-            // let the broker poll again instead of failing the whole worker.
-            Err(error) if error.to_string() == "io_uring returned without a CQE" => Ok(()),
             Err(error) => Err(error),
         }
     }
@@ -823,12 +834,19 @@ impl UdpEndpoint {
         message.msg_iovlen = 1;
         message.msg_control = control.as_mut_ptr().cast();
         message.msg_controllen = control_len as _;
-        let fd = ring.register_fd(self.fd.as_raw_fd())?;
-        let entry = io_uring::opcode::SendMsg::new(fd, &message)
-            .build()
-            .flags(io_uring::squeue::Flags::FIXED_FILE)
-            .user_data(4);
-        let sent = ring.submit_wait(&entry)? as usize;
+        let sent = if self.direct_io {
+            let sent = unsafe { libc::sendmsg(self.fd.as_raw_fd(), &message, libc::MSG_NOSIGNAL) };
+            if sent < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            sent as usize
+        } else {
+            let fd = ring.register_fd(self.fd.as_raw_fd())?;
+            let entry = io_uring::opcode::SendMsg::new(fd, &message)
+                .build()
+                .flags(io_uring::squeue::Flags::FIXED_FILE);
+            ring.submit_wait(&entry)? as usize
+        };
         if sent != buffer.len() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WriteZero,
@@ -1620,7 +1638,7 @@ pub fn probe_kernel(options: &ProbeOptions) -> Vec<FeatureResult> {
     }
     if options.sqpoll {
         let result = setup_ring(
-            base_flags | 1 << 1,
+            (base_flags & !((1 << 8) | (1 << 13))) | (1 << 1),
             options.sqpoll_idle_ms,
             options.ring_entries,
         );
@@ -2080,7 +2098,7 @@ fn skip(name: &'static str, detail: impl Into<String>) -> FeatureResult {
 // ----- Kernel version detection -----
 
 /// Parse the kernel release string and return (major, minor, patch).
-/// Uses `uname -r` if available, otherwise falls back to parsing /proc/version.
+/// Reads the release directly from the uname syscall.
 pub fn kernel_release() -> (u16, u16, u16) {
     let mut info: libc::utsname = unsafe { zeroed() };
     // SAFETY: uname writes into a correctly sized, initialized utsname.
@@ -2131,6 +2149,25 @@ mod tests {
     use super::{
         probe_has_failures, FeatureResult, ProbeHeader, ProbeOp, ProbeOptions, Restriction,
     };
+
+    #[test]
+    #[ignore = "requires host io_uring support"]
+    fn submissions_preserve_unmatched_completions() {
+        let mut ring = super::RuntimeRing::new(16, false, [1, 1]).unwrap();
+        let duration = io_uring::types::Timespec::from(std::time::Duration::from_millis(1));
+        let unrelated = io_uring::opcode::Timeout::new(&duration)
+            .build()
+            .user_data(u64::MAX - 1);
+        // The timespec stays live until both completions have been consumed.
+        unsafe {
+            ring.inner.submission().push(&unrelated).unwrap();
+        }
+        ring.wait_timeout(std::time::Duration::from_millis(10))
+            .unwrap();
+        assert_eq!(ring.wait_completion(u64::MAX - 1), -libc::ETIME);
+        assert!(ring.completions.is_empty());
+        assert_eq!(ring.next_token, 2);
+    }
 
     #[test]
     #[ignore = "requires host io_uring support"]
