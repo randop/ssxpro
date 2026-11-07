@@ -1,0 +1,19 @@
+# x86_64-unknown-linux-musl builds are fully static and need a musl cross
+# toolchain. The environment entries below are picked up by cargo for build
+# scripts and are overridden by the same variables in the caller's
+# environment. See scripts/musl-toolchain.cmake.
+[target.x86_64-unknown-linux-musl]
+linker = "x86_64-linux-musl-gcc"
+# Use the non-PIE startup objects so the static link is self-consistent.
+# Distro musl-gcc wrappers (e.g. Arch's /usr/bin/musl-gcc) ignore rustc's
+# -static-pie default, and combining -static-pie crt objects with a non-PIE
+# -static link crashes at startup; relocation-model=static makes rustc pass
+# crt1.o/-static/-no-pie itself.
+rustflags = ["-C", "relocation-model=static"]
+
+[env]
+CC_x86_64_unknown_linux_musl = "x86_64-linux-musl-gcc"
+CXX_x86_64_unknown_linux_musl = "x86_64-linux-musl-g++"
+AR_x86_64_unknown_linux_musl = "x86_64-linux-musl-ar"
+RANLIB_x86_64_unknown_linux_musl = "x86_64-linux-musl-ranlib"
+CMAKE_TOOLCHAIN_FILE_x86_64_unknown_linux_musl = { value = "scripts/musl-toolchain.cmake", relative = true }
