@@ -88,54 +88,6 @@ build:x86_64-musl:
     expire_in: 1 week
 
 # ==================================================
-# ARMHF - 32-bit ARM HARD-FLOAT
-# ==================================================
-
-build:armhf:
-  stage: build
-  image: rust:1-trixie
-
-  variables:
-    LIBCLANG_PATH: /usr/lib/llvm-19/lib
-
-  before_script:
-    - apt-get update
-
-    - >
-      apt-get install -y --no-install-recommends
-      build-essential
-      cmake
-      perl
-      pkg-config
-      libclang-dev
-      gcc-arm-linux-gnueabihf
-      g++-arm-linux-gnueabihf
-      binutils-arm-linux-gnueabihf
-      libc6-dev-armhf-cross
-      linux-libc-dev-armhf-cross
-
-    - rm -rf /var/lib/apt/lists/*
-
-    - rustup target add armv7-unknown-linux-gnueabihf
-
-    # Verify ARMHF compiler and target libraries.
-    - arm-linux-gnueabihf-gcc --version
-    - test -f /usr/arm-linux-gnueabihf/lib/libc.so.6
-    - test -f /usr/arm-linux-gnueabihf/lib/ld-linux-armhf.so.3
-    - test -f /usr/arm-linux-gnueabihf/include/linux/io_uring.h
-
-  script:
-    - cargo tree -e features -i io-uring --target armv7-unknown-linux-gnueabihf
-    - cargo build --release --target armv7-unknown-linux-gnueabihf
-
-  artifacts:
-    name: "ssxpro-armhf-$CI_COMMIT_SHORT_SHA"
-    paths:
-      - target/armv7-unknown-linux-gnueabihf/release/ssx
-      - target/armv7-unknown-linux-gnueabihf/release/ssxd
-    expire_in: 1 week
-
-# ==================================================
 # ARM64 - AARCH64 GNU
 # ==================================================
 

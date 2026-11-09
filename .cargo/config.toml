@@ -11,10 +11,6 @@ linker = "x86_64-unknown-linux-musl-gcc"
 # crt1.o/-static/-no-pie itself.
 rustflags = ["-C", "relocation-model=static"]
 
-# ARMHF: 32-bit ARM hard-float.
-[target.armv7-unknown-linux-gnueabihf]
-linker = "arm-linux-gnueabihf-gcc"
-
 # ARM64: AArch64 GNU/Linux.
 [target.aarch64-unknown-linux-gnu]
 linker = "aarch64-linux-gnu-gcc"
@@ -33,22 +29,6 @@ CMAKE_TOOLCHAIN_FILE_x86_64_unknown_linux_musl = {
     value = "scripts/musl-toolchain.cmake",
     relative = true
 }
-
-# --------------------------------------------------
-# ARMHF
-# --------------------------------------------------
-
-CC_armv7_unknown_linux_gnueabihf = "arm-linux-gnueabihf-gcc"
-CXX_armv7_unknown_linux_gnueabihf = "arm-linux-gnueabihf-g++"
-AR_armv7_unknown_linux_gnueabihf = "arm-linux-gnueabihf-ar"
-RANLIB_armv7_unknown_linux_gnueabihf = "arm-linux-gnueabihf-ranlib"
-
-CMAKE_TOOLCHAIN_FILE_armv7_unknown_linux_gnueabihf = {
-    value = "scripts/armhf-toolchain.cmake",
-    relative = true
-}
-
-BINDGEN_EXTRA_CLANG_ARGS_armv7_unknown_linux_gnueabihf = "--target=arm-linux-gnueabihf -march=armv7-a -mfpu=vfpv3-d16 -mfloat-abi=hard -isystem /usr/arm-linux-gnueabihf/include"
 
 # --------------------------------------------------
 # ARM64
