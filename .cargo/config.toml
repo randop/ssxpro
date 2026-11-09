@@ -3,7 +3,7 @@
 # scripts and are overridden by the same variables in the caller's
 # environment. See scripts/musl-toolchain.cmake.
 [target.x86_64-unknown-linux-musl]
-linker = "x86_64-linux-musl-gcc"
+linker = "x86_64-unknown-linux-musl-gcc"
 # Use the non-PIE startup objects so the static link is self-consistent.
 # Distro musl-gcc wrappers (e.g. Arch's /usr/bin/musl-gcc) ignore rustc's
 # -static-pie default, and combining -static-pie crt objects with a non-PIE
@@ -11,9 +11,37 @@ linker = "x86_64-linux-musl-gcc"
 # crt1.o/-static/-no-pie itself.
 rustflags = ["-C", "relocation-model=static"]
 
+# ARM64: AArch64 GNU/Linux.
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+
 [env]
-CC_x86_64_unknown_linux_musl = "x86_64-linux-musl-gcc"
-CXX_x86_64_unknown_linux_musl = "x86_64-linux-musl-g++"
-AR_x86_64_unknown_linux_musl = "x86_64-linux-musl-ar"
-RANLIB_x86_64_unknown_linux_musl = "x86_64-linux-musl-ranlib"
-CMAKE_TOOLCHAIN_FILE_x86_64_unknown_linux_musl = { value = "scripts/musl-toolchain.cmake", relative = true }
+# --------------------------------------------------
+# x86_64 musl
+# --------------------------------------------------
+
+CC_x86_64_unknown_linux_musl = "x86_64-unknown-linux-musl-gcc"
+CXX_x86_64_unknown_linux_musl = "x86_64-unknown-linux-musl-g++"
+AR_x86_64_unknown_linux_musl = "x86_64-unknown-linux-musl-ar"
+RANLIB_x86_64_unknown_linux_musl = "x86_64-unknown-linux-musl-ranlib"
+
+CMAKE_TOOLCHAIN_FILE_x86_64_unknown_linux_musl = {
+    value = "scripts/musl-toolchain.cmake",
+    relative = true
+}
+
+# --------------------------------------------------
+# ARM64
+# --------------------------------------------------
+
+CC_aarch64_unknown_linux_gnu = "aarch64-linux-gnu-gcc"
+CXX_aarch64_unknown_linux_gnu = "aarch64-linux-gnu-g++"
+AR_aarch64_unknown_linux_gnu = "aarch64-linux-gnu-ar"
+RANLIB_aarch64_unknown_linux_gnu = "aarch64-linux-gnu-ranlib"
+
+CMAKE_TOOLCHAIN_FILE_aarch64_unknown_linux_gnu = {
+    value = "scripts/arm64-toolchain.cmake",
+    relative = true
+}
+
+BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu = "--target=aarch64-linux-gnu -isystem /usr/aarch64-linux-gnu/include"

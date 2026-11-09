@@ -1,0 +1,133 @@
+
+stages:
+  - build
+
+variables:
+  CARGO_HOME: "$CI_PROJECT_DIR/.cache/cargo"
+  CARGO_TARGET_DIR: "$CI_PROJECT_DIR/target"
+  CARGO_TERM_COLOR: "always"
+
+# Separate cache per architecture and job.
+cache:
+  key: "$CI_JOB_NAME-$CI_COMMIT_REF_SLUG"
+  paths:
+    - .cache/cargo/registry/
+    - .cache/cargo/git/
+    - target/
+
+# ==================================================
+# x86_64 GNU
+# ==================================================
+
+build:x86_64:
+  stage: build
+  image: rust:1-trixie
+
+  variables:
+    LIBCLANG_PATH: /usr/lib/llvm-19/lib
+
+  before_script:
+    - apt-get update
+    - apt-get install -y --no-install-recommends
+      build-essential
+      cmake
+      perl
+      pkg-config
+      libclang-dev
+    - rm -rf /var/lib/apt/lists/*
+
+  script:
+    - cargo build --release
+
+  artifacts:
+    name: "ssxpro-x86_64-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - target/release/ssx
+      - target/release/ssxd
+    expire_in: 1 week
+
+# ==================================================
+# x86_64 MUSL - FULLY STATIC
+# ==================================================
+
+build:x86_64-musl:
+  stage: build
+
+  image:
+    name: ghcr.io/rust-cross/rust-musl-cross:x86_64-musl
+
+  before_script:
+    - apt-get update
+    - apt-get install -y --no-install-recommends perl binutils
+    - rm -rf /var/lib/apt/lists/*
+
+    # Verify musl cross-compiler.
+    - command -v x86_64-unknown-linux-musl-gcc
+    - command -v x86_64-unknown-linux-musl-g++
+    - command -v x86_64-unknown-linux-musl-ar
+
+  script:
+    - cargo build --release --target x86_64-unknown-linux-musl
+
+    # Verify static binaries.
+    - |
+      for binary in ssx ssxd; do
+        path="target/x86_64-unknown-linux-musl/release/$binary"
+
+        if readelf -l "$path" | grep -q 'INTERP'; then
+          echo "ERROR: $path is dynamically linked" >&2
+          exit 1
+        fi
+      done
+
+  artifacts:
+    name: "ssxpro-x86_64-musl-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - target/x86_64-unknown-linux-musl/release/ssx
+      - target/x86_64-unknown-linux-musl/release/ssxd
+    expire_in: 1 week
+
+# ==================================================
+# ARM64 - AARCH64 GNU
+# ==================================================
+
+build:arm64:
+  stage: build
+  image: rust:1-trixie
+
+  variables:
+    LIBCLANG_PATH: /usr/lib/llvm-19/lib
+
+  before_script:
+    - apt-get update
+
+    - >
+      apt-get install -y --no-install-recommends
+      build-essential
+      cmake
+      perl
+      pkg-config
+      libclang-dev
+      gcc-aarch64-linux-gnu
+      g++-aarch64-linux-gnu
+      binutils-aarch64-linux-gnu
+      libc6-dev-arm64-cross
+
+    - rm -rf /var/lib/apt/lists/*
+
+    - rustup target add aarch64-unknown-linux-gnu
+
+    # Verify ARM64 compiler and target libraries.
+    - aarch64-linux-gnu-gcc --version
+    - test -f /usr/aarch64-linux-gnu/lib/libc.so.6
+
+  script:
+    - cargo build --release --target aarch64-unknown-linux-gnu
+
+  artifacts:
+    name: "ssxpro-arm64-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - target/aarch64-unknown-linux-gnu/release/ssx
+      - target/aarch64-unknown-linux-gnu/release/ssxd
+    expire_in: 1 week
+

@@ -10,7 +10,14 @@ path = "src/lib.rs"
 
 [dependencies]
 libc.workspace = true
+
+# Default prebuilt bindings for supported architectures.
+[target.'cfg(not(target_arch = "arm"))'.dependencies]
 io-uring.workspace = true
+
+# Generate architecture-specific bindings for ARMHF.
+[target.'cfg(target_arch = "arm")'.dependencies]
+io-uring = { workspace = true, features = ["bindgen"] }
 
 [lints]
 workspace = true
