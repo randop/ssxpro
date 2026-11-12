@@ -1,9 +1,19 @@
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:88b66b9e8cd537f975cb001b0135eb217cee1164bd5a42b7fd793896ed2360ca -->
+
+<!-- coderabbit-ai-generated-section:v1:fbc30e1676c26ef6a72d0b7a53682e8a1768627613d32fd8549a4fc1602be5a4 -->
+
 # ssxpro protocol and security specification
 
 Status: M0 baseline (2026-11-04)  
-Protocol version: 1  
-ALPN: `ssxpro/1`  
+Protocol version: 2<br>
+ALPN: `ssxpro/2`<br>
 Transport: QUIC over UDP, normally port 22. This is a new protocol and is not SSH.
+
+## Upgrade compatibility
+
+Version 2 requires ALPN `ssxpro/2` and Hello version 2. Its AuthChallenge is 33 bytes (32-byte nonce plus compression selector), including when compression is off. Version 1 retains its established 32-byte AuthChallenge; this implementation does not negotiate `ssxpro/1`. Clients and servers must be upgraded together, including deployments with compression off. Mixed versions fail ALPN negotiation. The authentication proof construction remains unchanged.
 
 ## Goals and non-goals
 
@@ -13,7 +23,7 @@ ssxpro provides public-key authenticated interactive login to one PTY-backed log
 
 QUIC provides confidentiality, integrity, peer transport authentication, stream ordering, and flow control. TLS 1.3 is carried inside QUIC by quiche/BoringSSL; there is no second encryption layer.
 
-The client negotiates ALPN `ssxpro/1`. Stream 0 is the bidirectional control stream. Stream 4 is a bidirectional byte stream for PTY data. The client opens stream 4 immediately after `OpenShell` with a single 0x00 open marker; the server discards exactly that first byte. All remaining stream-4 bytes carry PTY data, either raw or in compression frames when the server selected a compression mode. QUIC flow control supplies backpressure. A stream 4 whose first byte is not 0x00, or a FIN before the marker, is a protocol error. All other stream IDs are forbidden in v1. The control stream is opened first and has priority over PTY data.
+The client negotiates ALPN `ssxpro/2`. Stream 0 is the bidirectional control stream. Stream 4 is a bidirectional byte stream for PTY data. The client opens stream 4 immediately after `OpenShell` with a single 0x00 open marker; the server discards exactly that first byte. All remaining stream-4 bytes carry PTY data, either raw or in compression frames when the server selected a compression mode. QUIC flow control supplies backpressure. A stream 4 whose first byte is not 0x00, or a FIN before the marker, is a protocol error. All other stream IDs are forbidden in v2. The control stream is opened first and has priority over PTY data.
 
 Control frames are `type` followed by `length` followed by `payload`. `type` is a QUIC varint; `length` is an unsigned big-endian 16-bit byte count. The payload is at most 4096 bytes. Integers in payloads are unsigned big-endian unless stated otherwise. Strings are UTF-8, nonempty where required, and contain no NUL. Decoders reject trailing bytes, invalid UTF-8, noncanonical/overflowing integer encodings, unknown message types, and lengths above the bound. A frame is not acted on until its full declared payload has arrived.
 
@@ -23,7 +33,7 @@ Control frames are `type` followed by `length` followed by `payload`. `type` is 
 
 | Type | Direction | Payload |
 |---|---|---|
-| 0x00 `Hello` | client→server | version u16 (=1), feature bits u32 (unknown bits rejected); bits 0–2 advertise LZ4, Snappy and Zstd stream compression support |
+| 0x00 `Hello` | client→server | version u16 (=2), feature bits u32 (unknown bits rejected); bits 0–2 advertise LZ4, Snappy and Zstd stream compression support |
 | 0x01 `AuthChallenge` | server→client | 32-byte unpredictable server nonce, selected compression u8 (0=off, 1=LZ4, 2=Snappy, 3=Zstd) |
 | 0x02 `AuthRequest` | client→server | username (u16 length + UTF-8), Ed25519 public key (32), client nonce (32), signature (64) |
 | 0x03 `AuthOk` | server→client | empty |
@@ -164,3 +174,6 @@ Kernel evidence references: [Linux io_uring UAPI](https://github.com/torvalds/li
 quiche is pinned to the published `0.30.0` release. Its BoringSSL ABI pin is upstream commit `44b3df6f03d85c901767250329c571db405122d5`, supplied by the matching `boring-sys` 4.22.0 build. This is a source pin, not a promise of an independently maintained fork. `boring-sys` builds that pinned source and applies its compatibility patches.
 
 To update, select a quiche release, inspect its resolved `boring-sys` BoringSSL revision and any patches, update the exact quiche dependency and `BORINGSSL_COMMIT` together, regenerate the lockfile, then run build, audit, and TLS/exporter compatibility checks. Never float either dependency on a branch or tag in a release build. Review BoringSSL's upstream security advisories before accepting the update.
+
+
+<!-- /coderabbit-ai-generated:v1 -->

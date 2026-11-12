@@ -63,6 +63,7 @@ struct PeerSession {
     pty_pending: VecDeque<Vec<u8>>,
     pty_pending_bytes: usize,
     pty_input: VecDeque<u8>,
+    input_fin: bool,
     pty_fin: bool,
     exit_observed_at: Option<Instant>,
     max_rows: u16,
@@ -778,6 +779,7 @@ fn serve_worker(
                             pty_pending: VecDeque::new(),
                             pty_pending_bytes: 0,
                             pty_input: VecDeque::new(),
+                            input_fin: false,
                             pty_fin: false,
                             exit_observed_at: None,
                             max_rows: config.session.max_rows,
@@ -1115,7 +1117,7 @@ fn process_control(
             peer.state.accept(&message)?;
             match message {
                 Message::Hello {
-                    version: 1,
+                    version: 2,
                     features,
                 } => {
                     let selected = negotiate_compression(configured_compression, features)?;
@@ -1433,6 +1435,7 @@ fn close_peer_session(
     peer.pty_pending.clear();
     peer.pty_pending_bytes = 0;
     peer.pty_fin = false;
+    peer.input_fin = false;
     peer.exit_observed_at = None;
     if let Some(mut token) = peer.session_token.take() {
         token.zeroize();
@@ -1447,6 +1450,13 @@ fn process_data(
         return Ok(());
     }
     drain_pty_input(peer)?;
+    if !decode_pty_input(peer, &[])? {
+        return Ok(());
+    }
+    if peer.input_fin {
+        finish_pty_input(peer)?;
+        return Ok(());
+    }
     let mut input = [0u8; 16 * 1024];
     for stream in peer.conn.readable().collect::<Vec<_>>() {
         if stream != 4 {
@@ -1481,27 +1491,44 @@ fn process_data(
                 peer.stream4_opened = true;
                 data = rest;
             }
-            if !data.is_empty() {
-                if let Some(decoder) = peer.compression_decoder.as_mut() {
-                    let mut decoded = Vec::new();
-                    decoder.push(data, &mut decoded)?;
-                    peer.pty_input.extend(decoded);
-                } else {
-                    peer.pty_input.extend(data);
-                }
+            peer.input_fin = fin;
+            if !decode_pty_input(peer, data)? {
+                break;
             }
             if fin {
-                if let Some(decoder) = peer.compression_decoder.as_ref() {
-                    decoder.finish()?;
-                }
-                peer.pty_input.push_back(0x04);
-                drain_pty_input(peer)?;
+                finish_pty_input(peer)?;
                 break;
             }
             drain_pty_input(peer)?;
         }
     }
     Ok(())
+}
+
+// Retry retained frames even when QUIC no longer reports stream 4 readable.
+fn decode_pty_input(
+    peer: &mut PeerSession,
+    data: &[u8],
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let capacity = (256 * 1024usize).saturating_sub(peer.pty_input.len() + 1);
+    if let Some(decoder) = peer.compression_decoder.as_mut() {
+        let mut decoded = Vec::new();
+        let blocked = decoder.push_bounded(data, &mut decoded, capacity)?;
+        peer.pty_input.extend(decoded);
+        Ok(!blocked)
+    } else {
+        peer.pty_input.extend(data);
+        Ok(true)
+    }
+}
+
+fn finish_pty_input(peer: &mut PeerSession) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(decoder) = peer.compression_decoder.as_ref() {
+        decoder.finish()?;
+    }
+    peer.input_fin = false;
+    peer.pty_input.push_back(0x04);
+    drain_pty_input(peer)
 }
 
 fn pty_reader(master_fd: RawFd) -> Result<PtyReader, Box<dyn std::error::Error>> {

@@ -234,9 +234,20 @@ impl Decoder {
     /// Decode every complete frame in the newly supplied bytes and append the
     /// decompressed data to `output`.
     pub fn push(&mut self, input: &[u8], output: &mut Vec<u8>) -> Result<(), CompressionError> {
-        if input.is_empty() {
-            return Ok(());
-        }
+        self.push_bounded(input, output, usize::MAX).map(|_| ())
+    }
+
+    /// Append at most `capacity` decoded bytes. Returns true if a complete
+    /// frame is retained for lack of output space. While true, callers must
+    /// drain output and retry with empty input before supplying more bytes.
+    pub fn push_bounded(
+        &mut self,
+        input: &[u8],
+        output: &mut Vec<u8>,
+        capacity: usize,
+    ) -> Result<bool, CompressionError> {
+        let initial_len = output.len();
+        let mut blocked = false;
         // Move the partial frame buffer out so decoded payload slices do not
         // overlap the mutable codec state.
         let mut partial = std::mem::take(&mut self.partial);
@@ -271,6 +282,10 @@ impl Decoder {
             if remaining.len() < total_len {
                 break;
             }
+            if uncompressed_len > capacity.saturating_sub(output.len() - initial_len) {
+                blocked = true;
+                break;
+            }
             let payload = &remaining[FRAME_HEADER_LEN..total_len];
             match format {
                 FORMAT_STORED => {
@@ -289,11 +304,11 @@ impl Decoder {
         if offset > 0 {
             partial.drain(..offset);
         }
-        if partial.len() > MAX_FRAME_LEN {
+        if !blocked && partial.len() > MAX_FRAME_LEN {
             return Err(CompressionError::InvalidLength);
         }
         self.partial = partial;
-        Ok(())
+        Ok(blocked)
     }
 
     /// Verify that the peer ended on a frame boundary.
@@ -462,6 +477,34 @@ mod tests {
                 &mut output
             )
             .is_err());
+    }
+
+    #[test]
+    fn bounded_decode_retains_frames_until_output_drains() {
+        for compression in [Compression::Fast, Compression::Standard, Compression::High] {
+            let data = vec![b'x'; MAX_BLOCK_SIZE * 8];
+            let encoded = Encoder::new(compression).unwrap().encode(&data).unwrap();
+            let mut decoder = Decoder::new(compression).unwrap();
+            let mut output = Vec::new();
+            assert!(decoder
+                .push_bounded(&encoded, &mut output, MAX_BLOCK_SIZE - 1)
+                .unwrap());
+            assert!(output.is_empty());
+            let mut all = Vec::new();
+            loop {
+                output.clear();
+                let blocked = decoder
+                    .push_bounded(&[], &mut output, MAX_BLOCK_SIZE)
+                    .unwrap();
+                assert!(output.len() <= MAX_BLOCK_SIZE);
+                all.extend_from_slice(&output);
+                if !blocked {
+                    break;
+                }
+            }
+            decoder.finish().unwrap();
+            assert_eq!(all, data);
+        }
     }
 
     #[test]

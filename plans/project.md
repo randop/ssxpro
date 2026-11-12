@@ -1,3 +1,7 @@
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:5c15e29601bb0590748caf7e743253ecdcadf5cb76c5503ca9d480957b43c83a -->
+
 # ssxpro — P-RAN-11
 
 Status: In progress (2026-11-12) — M0–M3 complete; M5 functional end-to-end including server-enforced PTY compression; M4, M6, M7 partial; M8/M9 foundations only; M10 backlog; M11 docs partial.
@@ -15,7 +19,7 @@ Status: In progress (2026-11-12) — M0–M3 complete; M5 functional end-to-end 
 
 ## Progress snapshot (2026-11-12)
 
-**Working end to end.** `ssx` and `ssxd` complete a QUIC handshake (ALPN `ssxpro/1`) with Retry, pin the Ed25519 host SPKI, authenticate with a signed nonce, open a broker-created PTY login shell, carry interactive input/output over stream 4, and report the remote exit status. The workspace is at version `0.1.1`. Verified on the local dev host with `tests/ssx_e2e.py`:
+**Working end to end.** `ssx` and `ssxd` complete a QUIC handshake (ALPN `ssxpro/2`) with Retry, pin the Ed25519 host SPKI, authenticate with a signed nonce, open a broker-created PTY login shell, carry interactive input/output over stream 4, and report the remote exit status. The workspace is at version `0.1.1`. Verified on the local dev host with `tests/ssx_e2e.py`:
 
 * A. shell round-trip: login, command output, exit `0`
 * B. remote exit status: `exit 7` → client exit `7`
@@ -44,7 +48,7 @@ Status: In progress (2026-11-12) — M0–M3 complete; M5 functional end-to-end 
 * The local dev host runs Linux 6.8 (below the 6.12 baseline) without Landlock. The PTY pump warns and continues with seccomp only; a fail-closed baseline probe is still required.
 * Unprivileged dev mode (`--yes-I-know-permission-risks-go-ahead-please`, broker already running as the target account) exists for local testing; production remains root plus strict permissions.
 * The GitHub CI workflow was removed from the tree. `fmt`/`clippy`/`test`/`audit`/`deny` run locally through `scripts/cargo-pinned.sh`; the kernel matrix job is only documented in `docs/ci-kernels.md`.
-* Compression added one byte to the `AuthChallenge` payload (now 33 bytes) while the protocol version remains `1`. Version `0.1.0` and `0.1.1` peers therefore do not interoperate; the mismatch fails closed, but a protocol-version decision is still required before release.
+* Compression uses protocol version 2 and ALPN `ssxpro/2`, with a 33-byte `AuthChallenge` even when compression is off. Clients and servers must be upgraded together; legacy `ssxpro/1` peers retain their 32-byte format and cannot negotiate with version 2.
 
 ## Architecture
 
@@ -215,7 +219,7 @@ The sans-IO wire protocol for both roles. No sockets, no allocation on the hot p
 
 ## Scope
 
-* ALPN `ssxpro/1`. Stream 0 is the control stream (high priority). Stream 4 is the PTY data stream; with compression `off` it is raw bytes, otherwise it carries bounded compressed frames selected by the server. QUIC flow control does the work in both cases.
+* ALPN `ssxpro/2`. Stream 0 is the control stream (high priority). Stream 4 is the PTY data stream; with compression `off` it is raw bytes, otherwise it carries bounded compressed frames selected by the server. QUIC flow control does the work in both cases.
 * Control frames: varint type, length-prefixed, bounded fields, **max 4 KiB**.
   * `Hello{version, features}`
   * `AuthChallenge{server_nonce, compression}`
@@ -642,3 +646,6 @@ The custom auth protocol and the privilege-separation design are the highest-ris
 - [ ] Gate is linked as a blocker for the M11 release checklist
 
 **Assisted By:** Anthropic Claude Sonnet 5.5
+
+
+<!-- /coderabbit-ai-generated:v1 -->

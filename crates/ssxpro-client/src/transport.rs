@@ -290,7 +290,7 @@ pub fn connect_and_echo(
         }
         if pin_checked && !sent_hello {
             let hello = Message::Hello {
-                version: 1,
+                version: 2,
                 features: SUPPORTED_FEATURES,
             };
             send_control(&mut conn, &hello)?;

@@ -165,20 +165,31 @@ class PtySession:
             self._pump_once(0.25)
         return False
 
-    def send(self, data):
+    def send(self, data, timeout=30):
         # Bulk input can exceed both the local and remote PTY buffers. Keep
         # draining client output while writing so neither side can deadlock.
-        view = memoryview(data)
-        while view:
-            readable, writable, _ = select.select([self.fd], [self.fd], [], 0.25)
-            if readable:
-                self._read_chunk()
-            if not writable:
-                continue
-            written = os.write(self.fd, view[:4096])
-            if written == 0:
-                raise OSError("short write to PTY")
-            view = view[written:]
+        was_blocking = os.get_blocking(self.fd)
+        os.set_blocking(self.fd, False)
+        try:
+            deadline = time.monotonic() + timeout
+            view = memoryview(data)
+            while view:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("timed out sending data to PTY")
+                readable, writable, _ = select.select([self.fd], [self.fd], [], 0.25)
+                if readable:
+                    self._read_chunk()
+                if not writable:
+                    continue
+                try:
+                    written = os.write(self.fd, view[:4096])
+                except BlockingIOError:
+                    continue
+                if written == 0:
+                    raise OSError("short write to PTY")
+                view = view[written:]
+        finally:
+            os.set_blocking(self.fd, was_blocking)
 
     def wait_exit(self, timeout=30):
         deadline = time.time() + timeout
@@ -202,7 +213,7 @@ class PtySession:
         return -1
 
 
-def run_scenario(name, argv, steps, expect_status, expect_output=(), forbid_output=()):
+def run_scenario(name, argv, steps, expect_status, expect_output=(), forbid_output=(), validate_output=None):
     """Run one client session.
 
     Steps are one of:
@@ -214,24 +225,28 @@ def run_scenario(name, argv, steps, expect_status, expect_output=(), forbid_outp
     """
     session = PtySession(argv)
     ok = True
-    for step in steps:
-        if callable(step):
-            step(session)
-            continue
-        if isinstance(step, (int, float)):
-            time.sleep(step)
-            continue
-        if step[0] is None:
-            session.send(step[1])
-            continue
-        needle, payload = step
-        if not session.wait_for(needle, timeout=30):
-            print(f"[{name}] FAIL: timed out waiting for {needle!r}")
-            print(session.output[-2000:].decode(errors="replace"))
-            ok = False
-            break
-        if payload:
-            session.send(payload)
+    try:
+        for step in steps:
+            if callable(step):
+                step(session)
+                continue
+            if isinstance(step, (int, float)):
+                time.sleep(step)
+                continue
+            if step[0] is None:
+                session.send(step[1])
+                continue
+            needle, payload = step
+            if not session.wait_for(needle, timeout=30):
+                print(f"[{name}] FAIL: timed out waiting for {needle!r}")
+                print(session.output[-2000:].decode(errors="replace"))
+                ok = False
+                break
+            if payload:
+                session.send(payload)
+    except TimeoutError as exc:
+        print(f"[{name}] FAIL: {exc}")
+        ok = False
     status = session.wait_exit(timeout=30)
     if status != expect_status:
         print(f"[{name}] FAIL: exit status {status}, expected {expect_status}")
@@ -244,12 +259,22 @@ def run_scenario(name, argv, steps, expect_status, expect_output=(), forbid_outp
         if needle.encode() in session.output:
             print(f"[{name}] FAIL: output unexpectedly contains {needle!r}")
             ok = False
+    if validate_output is not None and not validate_output(session.output):
+        print(f"[{name}] FAIL: bulk output differs from expected sequence")
+        ok = False
     if not ok:
         print(f"[{name}] output tail:")
         print(session.output[-3000:].decode(errors="replace"))
     else:
         print(f"[{name}] PASS (exit {status})")
     return ok
+
+
+def validate_bulk_output(output):
+    normalized = output.replace(b"\r\n", b"\n")
+    match = re.search(rb"SEQ_BEGIN\n(.*?)SEQ_DONE\n", normalized, re.DOTALL)
+    expected = b"".join(f"{i}\n".encode() for i in range(1, BULK_LINES + 1))
+    return match is not None and match.group(1) == expected
 
 
 def main():
@@ -341,7 +366,7 @@ def main():
     )
 
     bulk_command = (
-        b"seq 1 "
+        b"printf 'SEQ_%s\\n' BEGIN; seq 1 "
         + str(BULK_LINES).encode()
         + b"; printf 'SEQ_%s\\n' DONE\r"
         b"printf 'BULK_%s\\n' READY; sha256sum; printf 'BULK_%s\\n' DONE\r"
@@ -363,6 +388,7 @@ def main():
             ],
             expect_status=0,
             expect_output=("SEQ_DONE", "BULK_DONE", BULK_INPUT_DIGEST, "kind=Status, value=0"),
+            validate_output=validate_bulk_output,
         )
     )
 
