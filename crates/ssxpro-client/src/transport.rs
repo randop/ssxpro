@@ -330,6 +330,7 @@ pub fn connect_and_echo(
                     Message::Challenge {
                         server_nonce,
                         compression: selected,
+                        ..
                     } => {
                         if !selected.is_supported_by(SUPPORTED_FEATURES) {
                             return Err(format!(
@@ -368,6 +369,7 @@ pub fn connect_and_echo(
                         let mut user_field = [0; 256];
                         user_field[..user_bytes.len()].copy_from_slice(user_bytes);
                         let request = Message::AuthRequest {
+                            extension: RESERVED_EXTENSION,
                             user: user_field,
                             user_len: user_bytes.len() as u16,
                             public_key: public.0,
@@ -378,7 +380,7 @@ pub fn connect_and_echo(
                         state.sent(&request)?;
                         debug1!(verbose, "sent authentication request for user={user}");
                     }
-                    Message::AuthOk => {
+                    Message::AuthOk { extension: _ } => {
                         auth_ok = true;
                         debug1!(verbose, "authentication succeeded");
                         let (rows, cols) = terminal_size();
@@ -389,6 +391,7 @@ pub fn connect_and_echo(
                         let length = term_bytes.len().min(64);
                         term[..length].copy_from_slice(&term_bytes[..length]);
                         let open = Message::OpenShell {
+                            extension: RESERVED_EXTENSION,
                             term,
                             term_len: length as u8,
                             rows,
@@ -398,7 +401,7 @@ pub fn connect_and_echo(
                         state.sent(&open)?;
                         debug1!(verbose, "shell opened (TERM={term_value}, {rows}x{cols})");
                     }
-                    Message::AuthFail { reason_class } => {
+                    Message::AuthFail { reason_class, .. } => {
                         return Err(format!(
                             "server rejected authentication (class {reason_class})"
                         )
@@ -507,6 +510,7 @@ pub fn connect_and_echo(
             let current_size = terminal_size();
             if current_size != last_size {
                 let resize = Message::Resize {
+                    extension: RESERVED_EXTENSION,
                     rows: current_size.0,
                     cols: current_size.1,
                 };
@@ -592,9 +596,18 @@ pub fn connect_and_echo(
             if length > 0 {
                 if let Some(stream_decoder) = compression_decoder.as_mut() {
                     let mut decoded = Vec::new();
-                    stream_decoder.push(&packet[..length], &mut decoded)?;
-                    if !decoded.is_empty() {
+                    let mut input = &packet[..length];
+                    loop {
+                        let blocked =
+                            stream_decoder.push_bounded(input, &mut decoded, MAX_BLOCK_SIZE)?;
+
                         ring_write_all(&mut ring, libc::STDOUT_FILENO, &decoded)?;
+                        if !blocked {
+                            break;
+                        }
+                        // Drain retained frames before receiving more stream data.
+                        decoded.clear();
+                        input = &[];
                     }
                 } else {
                     ring_write_all(&mut ring, libc::STDOUT_FILENO, &packet[..length])?;
@@ -616,7 +629,7 @@ pub fn connect_and_echo(
             while let Some(message) = decoder.decode_next()? {
                 state.accept(&message)?;
                 debug3!(verbose, "received control message: {message:?}");
-                if let Message::Exit { kind, value } = message {
+                if let Message::Exit { kind, value, .. } = message {
                     remote_status = if kind == ExitKind::Status {
                         value
                     } else {

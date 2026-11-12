@@ -1,7 +1,3 @@
-<!-- coderabbit-ai-generated:v1 -->
-
-<!-- coderabbit-ai-generated-section:v1:5c15e29601bb0590748caf7e743253ecdcadf5cb76c5503ca9d480957b43c83a -->
-
 # ssxpro — P-RAN-11
 
 Status: In progress (2026-11-12) — M0–M3 complete; M5 functional end-to-end including server-enforced PTY compression; M4, M6, M7 partial; M8/M9 foundations only; M10 backlog; M11 docs partial.
@@ -645,6 +641,3 @@ The custom auth protocol and the privilege-separation design are the highest-ris
 - [ ] Gate is linked as a blocker for the M11 release checklist
 
 **Assisted By:** Anthropic Claude Sonnet 5.5
-
-
-<!-- /coderabbit-ai-generated:v1 -->

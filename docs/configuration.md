@@ -1,7 +1,3 @@
-<!-- coderabbit-ai-generated:v1 -->
-
-<!-- coderabbit-ai-generated-section:v1:b502c95b7bbbe5b2dc479b00d336100bc6a2eba03502a7108acc0f79320a1304 -->
-
 # Configuration
 
 Both programs deserialize YAML into strict, typed structures. Unknown keys and wrong types are errors; all omitted keys receive the defaults shown below. Range and cross-field errors identify the YAML key and line. Parser errors include the YAML parser's line and column.
@@ -78,13 +74,7 @@ known_hosts: /home/alice/.ssx/known_hosts
 known_hosts_policy: ask
 ```
 
-<!-- coderabbit-ai-generated:v1 -->
-
-<!-- coderabbit-ai-generated-section:v1:dd63097dae93d7fab181d23d2c94983e0f70671d580ab17d4764f8ec5df2755c -->
-
 Client `known_hosts_policy` is `deny`, `ask` (default), or `approve`. `deny` rejects a host that is not already pinned; `ask` prints the server key fingerprint and prompts `Allow this host? (y/N)`, accepting only an explicit `y` or `yes`; `approve` saves an unknown host key without prompting. A changed host key is always a fatal error. Accepted keys are appended to the secure default `~/.ssx/known_hosts` (directory mode `0700`, file mode `0600`); a custom `known_hosts` path must already contain the pin. `--approve-host` automatically approves and saves an unknown host key for one connection, overriding the configured policy.
-
-<!-- /coderabbit-ai-generated:v1 -->
 
 The target is `USER@HOST[:PORT]` or a configured host alias. Bracket an IPv6 literal when supplying a port, for example `alice@[2001:db8::1]:2222`. A port in the target overrides an alias or config port; `--port` overrides both. Host aliases require a nonempty host. Alias fields inherit global port and identity when omitted.
 
@@ -127,6 +117,3 @@ Public keys are checked in two places, in order:
 2. `~USER/.ssx/<auth.authorized_keys>` (default `authorized_keys`): the per-user file, read only when the server-wide list did not match. Home, `.ssx`, and key-file ownership and modes are checked before reading. The permission-risk override flag skips these checks for unprivileged development.
 
 Each non-comment line in either file is `ed25519 BASE64_KEY [comment]`; any option or unknown token rejects the line.
-
-
-<!-- /coderabbit-ai-generated:v1 -->

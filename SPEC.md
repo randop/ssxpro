@@ -1,9 +1,3 @@
-<!-- coderabbit-ai-generated:v1 -->
-
-<!-- coderabbit-ai-generated-section:v1:88b66b9e8cd537f975cb001b0135eb217cee1164bd5a42b7fd793896ed2360ca -->
-
-<!-- coderabbit-ai-generated-section:v1:fbc30e1676c26ef6a72d0b7a53682e8a1768627613d32fd8549a4fc1602be5a4 -->
-
 # ssxpro protocol and security specification
 
 Status: M0 baseline (2026-11-04)  
@@ -13,7 +7,7 @@ Transport: QUIC over UDP, normally port 22. This is a new protocol and is not SS
 
 ## Protocol versioning
 
-Version 1 requires ALPN `ssxpro/1` and Hello version 1. Its AuthChallenge is 33 bytes (32-byte nonce plus compression selector), including when compression is off. Hello also carries a reserved `u32` extension word: version 1 senders set it to zero, and receivers reject any nonzero value until a future version defines it. This is the initial release, so there are no legacy peers or compatibility modes; clients and servers must use this version. Mixed versions fail ALPN negotiation. The authentication proof construction remains unchanged.
+Version 1 requires ALPN `ssxpro/1` and Hello version 1. Its AuthChallenge is 37 bytes: the 32-byte nonce, the compression selector, and the extension word, including when compression is off. Every control frame except `Close` ends with a reserved `u32` extension word: version 1 senders set it to zero, and receivers reject any nonzero value until a future version defines it. This is the initial release, so there are no legacy peers or compatibility modes; clients and servers must use this version. Mixed versions fail ALPN negotiation. The authentication proof construction remains unchanged.
 
 ## Goals and non-goals
 
@@ -27,21 +21,17 @@ The client negotiates ALPN `ssxpro/1`. Stream 0 is the bidirectional control str
 
 Control frames are `type` followed by `length` followed by `payload`. `type` is a QUIC varint; `length` is an unsigned big-endian 16-bit byte count. The payload is at most 4096 bytes. Integers in payloads are unsigned big-endian unless stated otherwise. Strings are UTF-8, nonempty where required, and contain no NUL. Decoders reject trailing bytes, invalid UTF-8, noncanonical/overflowing integer encodings, unknown message types, and lengths above the bound. A frame is not acted on until its full declared payload has arrived.
 
-<!-- coderabbit-ai-generated:v1 -->
-
-<!-- coderabbit-ai-generated-section:v1:f27873c5831c54ba43fcfdd32b555f28208c18f69950dc9c0ba5902665da1380 -->
-
 | Type | Direction | Payload |
 |---|---|---|
 | 0x00 `Hello` | client→server | version u16 (=1), feature bits u32 (unknown bits rejected), reserved extension u32 (=0; nonzero rejected); bits 0–2 advertise LZ4, Snappy and Zstd stream compression support |
-| 0x01 `AuthChallenge` | server→client | 32-byte unpredictable server nonce, selected compression u8 (0=off, 1=LZ4, 2=Snappy, 3=Zstd) |
-| 0x02 `AuthRequest` | client→server | username (u16 length + UTF-8), Ed25519 public key (32), client nonce (32), signature (64) |
-| 0x03 `AuthOk` | server→client | empty |
-| 0x04 `AuthFail` | server→client | reason class u8; classes are `denied`=1 and `temporarily_unavailable`=2 |
-| 0x05 `OpenShell` | client→server | terminal name (u16 length + UTF-8, max 64), rows u16, columns u16 |
-| 0x06 `Resize` | client→server | rows u16, columns u16 |
-| 0x07 `Signal` | client→server | signal u8: HUP=1, INT=2, QUIT=3, TERM=4, KILL=5, TSTP=6, CONT=7, WINCH=8 |
-| 0x08 `Exit` | server→client | kind u8 (status=0 or signal=1), value u8 |
+| 0x01 `AuthChallenge` | server→client | 32-byte unpredictable server nonce, selected compression u8 (0=off, 1=LZ4, 2=Snappy, 3=Zstd), reserved extension u32 (=0; nonzero rejected) |
+| 0x02 `AuthRequest` | client→server | username (u16 length + UTF-8), Ed25519 public key (32), client nonce (32), signature (64), reserved extension u32 (=0; nonzero rejected) |
+| 0x03 `AuthOk` | server→client | reserved extension u32 (=0; nonzero rejected) |
+| 0x04 `AuthFail` | server→client | reason class u8 (`denied`=1, `temporarily_unavailable`=2), reserved extension u32 (=0; nonzero rejected) |
+| 0x05 `OpenShell` | client→server | terminal name (u16 length + UTF-8, max 64), rows u16, columns u16, reserved extension u32 (=0; nonzero rejected) |
+| 0x06 `Resize` | client→server | rows u16, columns u16, reserved extension u32 (=0; nonzero rejected) |
+| 0x07 `Signal` | client→server | signal u8: HUP=1, INT=2, QUIT=3, TERM=4, KILL=5, TSTP=6, CONT=7, WINCH=8, reserved extension u32 (=0; nonzero rejected) |
+| 0x08 `Exit` | server→client | kind u8 (status=0 or signal=1), value u8, reserved extension u32 (=0; nonzero rejected) |
 | 0x09 `Close` | either | application code u16 |
 
 Dimensions must be in 1..=4096. Terminal names are limited to 64 bytes. Username is limited to 256 bytes. Control message-specific exact payload lengths are mandatory. `Exit` status is 0..=255; signal values are native Linux signal numbers in 1..=64 (including signals outside the `Signal` control allowlist), as reported by `waitid`. These differ from control-message codes. Close codes are 0 normal, 1 protocol error, 2 authentication failed, 3 resource limit, 4 internal error. The peer receives only the coarse `AuthFail` class; details are logged locally by the monitor.
@@ -49,8 +39,6 @@ Dimensions must be in 1..=4096. Terminal names are limited to 64 bytes. Username
 The server configuration is authoritative for stream compression. `off` leaves stream 4 as raw bytes. `fast` selects LZ4, `standard` selects Snappy, and `high` selects Zstd level 19. The client advertises every algorithm it supports in `Hello`; the server selects the configured algorithm in `AuthChallenge` and rejects a client that does not advertise it. There is no silent downgrade. When compression is enabled, both directions send frames after the 0x00 open marker: `format:u8` (0 stored, 1 compressed), uncompressed length `u32be`, payload length `u32be`, then the payload. Stored blocks are used when compression would expand a block. Uncompressed blocks are limited to 64 KiB and compressed payloads to 128 KiB, so decoding is bounded. A FIN must fall on a frame boundary.
 
 ## Client state machine
-
-<!-- /coderabbit-ai-generated:v1 -->
 
 `Hello → Auth → Open → Running → Exit`:
 
@@ -174,6 +162,3 @@ Kernel evidence references: [Linux io_uring UAPI](https://github.com/torvalds/li
 quiche is pinned to the published `0.30.0` release. Its BoringSSL ABI pin is upstream commit `44b3df6f03d85c901767250329c571db405122d5`, supplied by the matching `boring-sys` 4.22.0 build. This is a source pin, not a promise of an independently maintained fork. `boring-sys` builds that pinned source and applies its compatibility patches.
 
 To update, select a quiche release, inspect its resolved `boring-sys` BoringSSL revision and any patches, update the exact quiche dependency and `BORINGSSL_COMMIT` together, regenerate the lockfile, then run build, audit, and TLS/exporter compatibility checks. Never float either dependency on a branch or tag in a release build. Review BoringSSL's upstream security advisories before accepting the update.
-
-
-<!-- /coderabbit-ai-generated:v1 -->

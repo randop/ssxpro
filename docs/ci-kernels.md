@@ -1,7 +1,3 @@
-<!-- coderabbit-ai-generated:v1 -->
-
-<!-- coderabbit-ai-generated-section:v1:ab3444855ecd46321173a37b2f45556210635c48278c86b8e75ab7abc0002acd -->
-
 # Kernel CI runners
 
 The planned kernel matrix will run on self-hosted Linux runners because GitHub-hosted Ubuntu jobs cannot select or boot a specific host kernel. Register two ephemeral runners with labels:
@@ -21,5 +17,3 @@ scripts/check-kernel-version.sh stable "$EXPECTED_STABLE_RELEASE"
 ```
 
 Set `EXPECTED_STABLE_RELEASE` explicitly to the required upstream `major.minor.patch` release. The stable check rejects a different release and separately requires Linux 6.12 or newer.
-
-<!-- /coderabbit-ai-generated:v1 -->

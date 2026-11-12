@@ -6,8 +6,9 @@ pub const MAX_FRAME: usize = 4096;
 pub const MAX_WIRE_FRAME: usize = MAX_FRAME + 10;
 /// The only wire protocol version supported by this release.
 pub const PROTOCOL_VERSION: u16 = 1;
-/// Reserved Hello extension word. Version 1 senders set it to zero and
-/// receivers reject any other value until a future version defines it.
+/// Reserved extension word carried as the last payload segment of every
+/// control frame except `Close`. Version 1 senders set it to zero and receivers
+/// reject any other value until a future version defines it.
 pub const RESERVED_EXTENSION: u32 = 0;
 pub const ALPN: &[u8] = b"ssxpro/1";
 pub const MAX_MONITOR_SIGN_INPUT: usize = 8192;
@@ -867,6 +868,7 @@ pub enum Message {
     Challenge {
         server_nonce: [u8; 32],
         compression: Compression,
+        extension: u32,
     },
     AuthRequest {
         user: [u8; 256],
@@ -874,27 +876,35 @@ pub enum Message {
         public_key: [u8; 32],
         client_nonce: [u8; 32],
         signature: [u8; 64],
+        extension: u32,
     },
-    AuthOk,
+    AuthOk {
+        extension: u32,
+    },
     AuthFail {
         reason_class: u8,
+        extension: u32,
     },
     OpenShell {
         term: [u8; 64],
         term_len: u8,
         rows: u16,
         cols: u16,
+        extension: u32,
     },
     Resize {
         rows: u16,
         cols: u16,
+        extension: u32,
     },
     Signal {
         signal: Signal,
+        extension: u32,
     },
     Exit {
         kind: ExitKind,
         value: u8,
+        extension: u32,
     },
     Close {
         code: u16,
@@ -948,31 +958,32 @@ pub fn encode(message: &Message, out: &mut [u8; MAX_WIRE_FRAME]) -> Result<usize
     let (kind, payload_len) = match message {
         Message::Hello { extension, .. } if *extension == RESERVED_EXTENSION => (0, 10),
         Message::Hello { .. } => return Err(ProtocolError::InvalidPayload),
-        Message::Challenge { .. } => (1, 33),
+        Message::Challenge { .. } => (1, 37),
         Message::AuthRequest { user, user_len, .. }
             if usize::from(*user_len) <= 256 && valid_user(&user[..usize::from(*user_len)]) =>
         {
-            (2, 2 + usize::from(*user_len) + 32 + 32 + 64)
+            (2, 2 + usize::from(*user_len) + 32 + 32 + 64 + 4)
         }
         Message::AuthRequest { .. } => return Err(ProtocolError::InvalidPayload),
-        Message::AuthOk => (3, 0),
-        Message::AuthFail { .. } => (4, 1),
+        Message::AuthOk { .. } => (3, 4),
+        Message::AuthFail { .. } => (4, 5),
         Message::OpenShell {
             term,
             term_len,
             rows,
             cols,
+            ..
         } if usize::from(*term_len) <= 64
             && valid_term(&term[..usize::from(*term_len)])
             && valid_window(*rows, *cols) =>
         {
-            (5, 1 + *term_len as usize + 4)
+            (5, 1 + *term_len as usize + 4 + 4)
         }
         Message::OpenShell { .. } => return Err(ProtocolError::InvalidPayload),
-        Message::Resize { rows, cols } if valid_window(*rows, *cols) => (6, 4),
+        Message::Resize { rows, cols, .. } if valid_window(*rows, *cols) => (6, 8),
         Message::Resize { .. } => return Err(ProtocolError::InvalidPayload),
-        Message::Signal { .. } => (7, 1),
-        Message::Exit { kind, value } if valid_exit(*kind, *value) => (8, 2),
+        Message::Signal { .. } => (7, 5),
+        Message::Exit { kind, value, .. } if valid_exit(*kind, *value) => (8, 6),
         Message::Exit { .. } => return Err(ProtocolError::InvalidPayload),
         Message::Close { .. } => (9, 2),
     };
@@ -996,9 +1007,11 @@ pub fn encode(message: &Message, out: &mut [u8; MAX_WIRE_FRAME]) -> Result<usize
         Message::Challenge {
             server_nonce,
             compression,
+            extension,
         } => {
-            p[..32].copy_from_slice(server_nonce);
+            p[0..32].copy_from_slice(server_nonce);
             p[32] = *compression as u8;
+            p[33..37].copy_from_slice(&extension.to_be_bytes());
         }
         Message::AuthRequest {
             user,
@@ -1006,36 +1019,59 @@ pub fn encode(message: &Message, out: &mut [u8; MAX_WIRE_FRAME]) -> Result<usize
             public_key,
             client_nonce,
             signature,
+            extension,
         } => {
             let n = *user_len as usize;
-            p[..2].copy_from_slice(&user_len.to_be_bytes());
+            p[0..2].copy_from_slice(&user_len.to_be_bytes());
             p[2..2 + n].copy_from_slice(&user[..n]);
             p[2 + n..34 + n].copy_from_slice(public_key);
             p[34 + n..66 + n].copy_from_slice(client_nonce);
-            p[66 + n..].copy_from_slice(signature);
+            p[66 + n..130 + n].copy_from_slice(signature);
+            p[130 + n..].copy_from_slice(&extension.to_be_bytes());
         }
-        Message::AuthOk => {}
-        Message::AuthFail { reason_class } => p[0] = *reason_class,
+        Message::AuthOk { extension } => p[0..4].copy_from_slice(&extension.to_be_bytes()),
+        Message::AuthFail {
+            reason_class,
+            extension,
+        } => {
+            p[0] = *reason_class;
+            p[1..5].copy_from_slice(&extension.to_be_bytes());
+        }
         Message::OpenShell {
             term,
             term_len,
             rows,
             cols,
+            extension,
         } => {
             let n = *term_len as usize;
             p[0] = *term_len;
             p[1..1 + n].copy_from_slice(&term[..n]);
             p[1 + n..3 + n].copy_from_slice(&rows.to_be_bytes());
-            p[3 + n..].copy_from_slice(&cols.to_be_bytes());
+            p[3 + n..5 + n].copy_from_slice(&cols.to_be_bytes());
+            p[5 + n..].copy_from_slice(&extension.to_be_bytes());
         }
-        Message::Resize { rows, cols } => {
-            p[..2].copy_from_slice(&rows.to_be_bytes());
-            p[2..].copy_from_slice(&cols.to_be_bytes());
+        Message::Resize {
+            rows,
+            cols,
+            extension,
+        } => {
+            p[0..2].copy_from_slice(&rows.to_be_bytes());
+            p[2..4].copy_from_slice(&cols.to_be_bytes());
+            p[4..8].copy_from_slice(&extension.to_be_bytes());
         }
-        Message::Signal { signal } => p[0] = *signal as u8,
-        Message::Exit { kind, value } => {
+        Message::Signal { signal, extension } => {
+            p[0] = *signal as u8;
+            p[1..5].copy_from_slice(&extension.to_be_bytes());
+        }
+        Message::Exit {
+            kind,
+            value,
+            extension,
+        } => {
             p[0] = *kind as u8;
             p[1] = *value;
+            p[2..6].copy_from_slice(&extension.to_be_bytes());
         }
         Message::Close { code } => p.copy_from_slice(&code.to_be_bytes()),
     }
@@ -1083,13 +1119,24 @@ pub fn decode(input: &[u8]) -> Result<(Message, usize), ProtocolError> {
                 extension,
             }
         }
-        1 if len == 33 => Message::Challenge {
-            server_nonce: p[..32].try_into().unwrap(),
-            compression: Compression::from_u8(p[32]).ok_or(ProtocolError::InvalidPayload)?,
-        },
-        2 if len >= 130 => {
+        1 if len == 37 => {
+            let extension = u32::from_be_bytes(p[33..37].try_into().unwrap());
+            if extension != RESERVED_EXTENSION {
+                return Err(ProtocolError::InvalidPayload);
+            }
+            Message::Challenge {
+                server_nonce: p[0..32].try_into().unwrap(),
+                compression: Compression::from_u8(p[32]).ok_or(ProtocolError::InvalidPayload)?,
+                extension,
+            }
+        }
+        2 if len >= 134 => {
             let n = u16::from_be_bytes([p[0], p[1]]) as usize;
-            if n > 256 || len != 130 + n || !valid_user(&p[2..2 + n]) {
+            if n > 256 || len != 134 + n || !valid_user(&p[2..2 + n]) {
+                return Err(ProtocolError::InvalidPayload);
+            }
+            let extension = u32::from_be_bytes(p[130 + n..134 + n].try_into().unwrap());
+            if extension != RESERVED_EXTENSION {
                 return Err(ProtocolError::InvalidPayload);
             }
             let mut user = [0; 256];
@@ -1099,19 +1146,39 @@ pub fn decode(input: &[u8]) -> Result<(Message, usize), ProtocolError> {
                 user_len: n as u16,
                 public_key: p[2 + n..34 + n].try_into().unwrap(),
                 client_nonce: p[34 + n..66 + n].try_into().unwrap(),
-                signature: p[66 + n..].try_into().unwrap(),
+                signature: p[66 + n..130 + n].try_into().unwrap(),
+                extension,
             }
         }
-        3 if len == 0 => Message::AuthOk,
-        4 if len == 1 => Message::AuthFail { reason_class: p[0] },
-        5 if len >= 5 => {
-            let n = p[0] as usize;
-            if n > 64 || len != 5 + n || !valid_term(&p[1..1 + n]) {
+        3 if len == 4 => {
+            let extension = u32::from_be_bytes(p[0..4].try_into().unwrap());
+            if extension != RESERVED_EXTENSION {
                 return Err(ProtocolError::InvalidPayload);
             }
-            let rows = u16::from_be_bytes([p[n + 1], p[n + 2]]);
-            let cols = u16::from_be_bytes([p[n + 3], p[n + 4]]);
+            Message::AuthOk { extension }
+        }
+        4 if len == 5 => {
+            let extension = u32::from_be_bytes(p[1..5].try_into().unwrap());
+            if extension != RESERVED_EXTENSION {
+                return Err(ProtocolError::InvalidPayload);
+            }
+            Message::AuthFail {
+                reason_class: p[0],
+                extension,
+            }
+        }
+        5 if len >= 9 => {
+            let n = p[0] as usize;
+            if n > 64 || len != 9 + n || !valid_term(&p[1..1 + n]) {
+                return Err(ProtocolError::InvalidPayload);
+            }
+            let rows = u16::from_be_bytes([p[1 + n], p[2 + n]]);
+            let cols = u16::from_be_bytes([p[3 + n], p[4 + n]]);
             if !valid_window(rows, cols) {
+                return Err(ProtocolError::InvalidPayload);
+            }
+            let extension = u32::from_be_bytes(p[5 + n..9 + n].try_into().unwrap());
+            if extension != RESERVED_EXTENSION {
                 return Err(ProtocolError::InvalidPayload);
             }
             let mut term = [0; 64];
@@ -1121,37 +1188,60 @@ pub fn decode(input: &[u8]) -> Result<(Message, usize), ProtocolError> {
                 term_len: n as u8,
                 rows,
                 cols,
+                extension,
             }
         }
-        6 if len == 4 => {
+        6 if len == 8 => {
             let rows = u16::from_be_bytes([p[0], p[1]]);
             let cols = u16::from_be_bytes([p[2], p[3]]);
             if !valid_window(rows, cols) {
                 return Err(ProtocolError::InvalidPayload);
             }
-            Message::Resize { rows, cols }
+            let extension = u32::from_be_bytes(p[4..8].try_into().unwrap());
+            if extension != RESERVED_EXTENSION {
+                return Err(ProtocolError::InvalidPayload);
+            }
+            Message::Resize {
+                rows,
+                cols,
+                extension,
+            }
         }
-        7 if len == 1 => Message::Signal {
-            signal: match p[0] {
-                1 => Signal::Hup,
-                2 => Signal::Int,
-                3 => Signal::Quit,
-                4 => Signal::Term,
-                5 => Signal::Kill,
-                6 => Signal::Tstp,
-                7 => Signal::Cont,
-                8 => Signal::Winch,
-                _ => return Err(ProtocolError::InvalidPayload),
-            },
-        },
-        8 if len == 2 && (p[0] == 0 || (p[0] == 1 && (1..=64).contains(&p[1]))) => Message::Exit {
-            kind: match p[0] {
-                0 => ExitKind::Status,
-                1 => ExitKind::Signal,
-                _ => return Err(ProtocolError::InvalidPayload),
-            },
-            value: p[1],
-        },
+        7 if len == 5 => {
+            let extension = u32::from_be_bytes(p[1..5].try_into().unwrap());
+            if extension != RESERVED_EXTENSION {
+                return Err(ProtocolError::InvalidPayload);
+            }
+            Message::Signal {
+                signal: match p[0] {
+                    1 => Signal::Hup,
+                    2 => Signal::Int,
+                    3 => Signal::Quit,
+                    4 => Signal::Term,
+                    5 => Signal::Kill,
+                    6 => Signal::Tstp,
+                    7 => Signal::Cont,
+                    8 => Signal::Winch,
+                    _ => return Err(ProtocolError::InvalidPayload),
+                },
+                extension,
+            }
+        }
+        8 if len == 6 && (p[0] == 0 || (p[0] == 1 && (1..=64).contains(&p[1]))) => {
+            let extension = u32::from_be_bytes(p[2..6].try_into().unwrap());
+            if extension != RESERVED_EXTENSION {
+                return Err(ProtocolError::InvalidPayload);
+            }
+            Message::Exit {
+                kind: match p[0] {
+                    0 => ExitKind::Status,
+                    1 => ExitKind::Signal,
+                    _ => return Err(ProtocolError::InvalidPayload),
+                },
+                value: p[1],
+                extension,
+            }
+        }
         9 if len == 2 => Message::Close {
             code: u16::from_be_bytes([p[0], p[1]]),
         },
@@ -1290,7 +1380,7 @@ impl ClientState {
     pub fn accept(&mut self, m: &Message) -> Result<(), ProtocolError> {
         *self = match (*self, m) {
             (Self::AwaitChallenge, Message::Challenge { .. }) => Self::AwaitAuth,
-            (Self::AwaitAuthResult, Message::AuthOk) => Self::Ready,
+            (Self::AwaitAuthResult, Message::AuthOk { extension: _ }) => Self::Ready,
             (Self::AwaitAuthResult, Message::AuthFail { .. } | Message::Close { .. }) => {
                 Self::Closed
             }
@@ -1314,7 +1404,7 @@ impl ServerState {
     pub fn sent(&mut self, m: &Message) -> Result<(), ProtocolError> {
         *self = match (*self, m) {
             (Self::AwaitAuth, Message::Challenge { .. }) => Self::AwaitAuth,
-            (Self::AuthPending, Message::AuthOk) => Self::AwaitOpen,
+            (Self::AuthPending, Message::AuthOk { extension: _ }) => Self::AwaitOpen,
             (Self::AuthPending, Message::AuthFail { .. } | Message::Close { .. }) => Self::Closed,
             (Self::AwaitOpen, Message::Close { .. }) => Self::Closed,
             (Self::AwaitAuth, Message::AuthFail { .. } | Message::Close { .. }) => Self::Closed,
@@ -1427,17 +1517,91 @@ mod tests {
     #[test]
     fn invalid_compression_id_is_rejected() {
         let message = Message::Challenge {
+            extension: RESERVED_EXTENSION,
             server_nonce: [0; 32],
             compression: Compression::Fast,
         };
         let mut frame = [0u8; MAX_WIRE_FRAME];
         let length = encode(&message, &mut frame).unwrap();
-        assert_eq!(length, 3 + 33);
-        frame[length - 1] = 4;
+        assert_eq!(length, 3 + 37);
+        frame[length - 5] = 4;
         assert_eq!(
             decode(&frame[..length]).unwrap_err(),
             ProtocolError::InvalidPayload
         );
+    }
+
+    #[test]
+    fn reserved_extension_is_the_last_payload_segment() {
+        let mut user = [0u8; 256];
+        user[0] = b'j';
+        user[1] = b'd';
+        let messages = [
+            Message::Hello {
+                version: PROTOCOL_VERSION,
+                features: SUPPORTED_FEATURES,
+                extension: RESERVED_EXTENSION,
+            },
+            Message::Challenge {
+                server_nonce: [1; 32],
+                compression: Compression::Standard,
+                extension: RESERVED_EXTENSION,
+            },
+            Message::AuthRequest {
+                user,
+                user_len: 2,
+                public_key: [2; 32],
+                client_nonce: [3; 32],
+                signature: [4; 64],
+                extension: RESERVED_EXTENSION,
+            },
+            Message::AuthOk {
+                extension: RESERVED_EXTENSION,
+            },
+            Message::AuthFail {
+                reason_class: 2,
+                extension: RESERVED_EXTENSION,
+            },
+            Message::OpenShell {
+                term: [0; 64],
+                term_len: 0,
+                rows: 24,
+                cols: 80,
+                extension: RESERVED_EXTENSION,
+            },
+            Message::Resize {
+                rows: 24,
+                cols: 80,
+                extension: RESERVED_EXTENSION,
+            },
+            Message::Signal {
+                signal: Signal::Winch,
+                extension: RESERVED_EXTENSION,
+            },
+            Message::Exit {
+                kind: ExitKind::Status,
+                value: 3,
+                extension: RESERVED_EXTENSION,
+            },
+        ];
+        for message in messages {
+            let mut frame = [0u8; MAX_WIRE_FRAME];
+            let length = encode(&message, &mut frame).unwrap();
+            assert_eq!(
+                &frame[length - 4..length],
+                &RESERVED_EXTENSION.to_be_bytes()
+            );
+            assert_eq!(decode(&frame[..length]).unwrap().0, message);
+            for index in length - 4..length {
+                let byte = frame[index];
+                frame[index] = byte ^ 0xff;
+                assert_eq!(
+                    decode(&frame[..length]).unwrap_err(),
+                    ProtocolError::InvalidPayload
+                );
+                frame[index] = byte;
+            }
+        }
     }
 
     #[test]
@@ -1452,6 +1616,7 @@ mod tests {
     fn server_waits_for_authorization_before_open() {
         let mut server = ServerState::AwaitAuth;
         let auth = Message::AuthRequest {
+            extension: RESERVED_EXTENSION,
             user: [0; 256],
             user_len: 1,
             public_key: [0; 32],
@@ -1461,6 +1626,7 @@ mod tests {
         server.accept(&auth).unwrap();
         assert_eq!(server, ServerState::AuthPending);
         let open = Message::OpenShell {
+            extension: RESERVED_EXTENSION,
             term: [0; 64],
             term_len: 0,
             rows: 24,
@@ -1469,9 +1635,18 @@ mod tests {
         assert!(server.accept(&open).is_err());
         assert!(server.accept(&auth).is_err());
         let mut denied = server;
-        denied.sent(&Message::AuthFail { reason_class: 1 }).unwrap();
+        denied
+            .sent(&Message::AuthFail {
+                extension: RESERVED_EXTENSION,
+                reason_class: 1,
+            })
+            .unwrap();
         assert_eq!(denied, ServerState::Closed);
-        server.sent(&Message::AuthOk).unwrap();
+        server
+            .sent(&Message::AuthOk {
+                extension: RESERVED_EXTENSION,
+            })
+            .unwrap();
         assert_eq!(server, ServerState::AwaitOpen);
         server.sent(&Message::Close { code: 0 }).unwrap();
         assert_eq!(server, ServerState::Closed);
@@ -1486,22 +1661,35 @@ mod tests {
                 extension: RESERVED_EXTENSION,
             },
             Message::Challenge {
+                extension: RESERVED_EXTENSION,
                 server_nonce: [7; 32],
                 compression: Compression::High,
             },
-            Message::AuthOk,
-            Message::AuthFail { reason_class: 2 },
+            Message::AuthOk {
+                extension: RESERVED_EXTENSION,
+            },
+            Message::AuthFail {
+                extension: RESERVED_EXTENSION,
+                reason_class: 2,
+            },
             Message::OpenShell {
+                extension: RESERVED_EXTENSION,
                 term: [0; 64],
                 term_len: 0,
                 rows: 24,
                 cols: 80,
             },
-            Message::Resize { rows: 25, cols: 90 },
+            Message::Resize {
+                extension: RESERVED_EXTENSION,
+                rows: 25,
+                cols: 90,
+            },
             Message::Signal {
+                extension: RESERVED_EXTENSION,
                 signal: Signal::Term,
             },
             Message::Exit {
+                extension: RESERVED_EXTENSION,
                 kind: ExitKind::Status,
                 value: 0,
             },
@@ -1616,7 +1804,12 @@ mod tests {
     #[test]
     fn strict_client_state() {
         let mut s = ClientState::Start;
-        assert_eq!(s.accept(&Message::AuthOk), Err(ProtocolError::InvalidState));
+        assert_eq!(
+            s.accept(&Message::AuthOk {
+                extension: RESERVED_EXTENSION,
+            }),
+            Err(ProtocolError::InvalidState)
+        );
     }
 
     #[test]
@@ -1643,11 +1836,13 @@ mod tests {
             .unwrap();
         state
             .accept(&Message::Challenge {
+                extension: RESERVED_EXTENSION,
                 server_nonce: [0; 32],
                 compression: Compression::Off,
             })
             .unwrap();
         let auth = Message::AuthRequest {
+            extension: RESERVED_EXTENSION,
             user: [0; 256],
             user_len: 0,
             public_key: [0; 32],
@@ -1655,9 +1850,14 @@ mod tests {
             signature: [0; 64],
         };
         state.sent(&auth).unwrap();
-        state.accept(&Message::AuthOk).unwrap();
+        state
+            .accept(&Message::AuthOk {
+                extension: RESERVED_EXTENSION,
+            })
+            .unwrap();
         state
             .sent(&Message::OpenShell {
+                extension: RESERVED_EXTENSION,
                 term: [0; 64],
                 term_len: 0,
                 rows: 24,
@@ -1672,6 +1872,7 @@ mod tests {
         let mut out = [0u8; MAX_WIRE_FRAME];
         for value in [1, 9, 15, 64] {
             let message = Message::Exit {
+                extension: RESERVED_EXTENSION,
                 kind: ExitKind::Signal,
                 value,
             };
@@ -1681,16 +1882,18 @@ mod tests {
         for value in [0, 65, 255] {
             assert!(encode(
                 &Message::Exit {
+                    extension: RESERVED_EXTENSION,
                     kind: ExitKind::Signal,
                     value
                 },
                 &mut out
             )
             .is_err());
-            assert!(decode(&[8, 0, 2, 1, value]).is_err());
+            assert!(decode(&[8, 0, 6, 1, value, 0, 0, 0, 0]).is_err());
         }
         assert!(encode(
             &Message::Resize {
+                extension: RESERVED_EXTENSION,
                 rows: 4096,
                 cols: 4096
             },
@@ -1699,6 +1902,7 @@ mod tests {
         .is_ok());
         assert!(encode(
             &Message::Resize {
+                extension: RESERVED_EXTENSION,
                 rows: 4097,
                 cols: 1
             },
@@ -1711,8 +1915,15 @@ mod tests {
             (Signal::Cont, 7),
             (Signal::Winch, 8),
         ] {
-            let length = encode(&Message::Signal { signal }, &mut out).unwrap();
-            assert_eq!(&out[..length], &[7, 0, 1, code]);
+            let length = encode(
+                &Message::Signal {
+                    signal,
+                    extension: RESERVED_EXTENSION,
+                },
+                &mut out,
+            )
+            .unwrap();
+            assert_eq!(&out[..length], &[7, 0, 5, code, 0, 0, 0, 0]);
         }
     }
 }

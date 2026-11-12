@@ -8,19 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.1] - 2026-11-12
 
 ### Added
-- Server-enforced PTY stream compression, configured with `compression: off|fast|standard|high`
-  - `off`: no compression
+- Server-enforced PTY stream compression, configured with `compression: off|fast|standard|high` (default `off`)
+  - `off`: raw stream-4 bytes
   - `fast`: LZ4, optimized for low CPU utilization
   - `standard`: Snappy
   - `high`: Zstd level 19
-- Compression negotiation through `Hello` feature bits and the server's `AuthChallenge` selection; unsupported clients fail closed instead of downgrading
-- Bounded stream-4 compression frames with stored-block fallback when compression would expand data
-- `ssxpro-compression` workspace crate with LZ4, Snappy and Zstd codecs
+- Compression negotiation through `Hello` feature bits and the server's `AuthChallenge` selection. Bits 0–2 advertise LZ4, Snappy, and Zstd; unknown bits are rejected. A client that does not advertise the configured algorithm is rejected.
+- Bounded stream-4 compression frames (`format:u8`, uncompressed length `u32be`, payload length `u32be`) with stored-block fallback when compression would expand data
+  - Uncompressed blocks are limited to 64 KiB and compressed payloads to 128 KiB
+  - A FIN must fall on a frame boundary
+  - Zstd decoding rejects a window larger than one block
+  - The server keeps decoded PTY input within 256 KiB and holds a complete frame until that queue has room
+- `ssxpro-compression` workspace crate with LZ4, Snappy, and Zstd codecs
+- End-to-end coverage for compression negotiation and bulk transfer in every mode (`tests/compression_e2e.sh`)
+- GitLab CI release builds for native `x86_64-unknown-linux-gnu`, fully static `x86_64-unknown-linux-musl`, and cross-compiled `aarch64-unknown-linux-gnu`
+- Cargo and CMake toolchain settings for those musl and aarch64 targets
+- Redistributed third-party `LICENSE`, `NOTICE`, and `AUTHORS` texts under `licenses/`, checked by `scripts/licenses.sh`
 
 ### Changed
-- Updated protocol specification, configuration reference, and example `ssxd.yaml` with compression settings
-- `AuthChallenge` now carries the selected stream-compression algorithm
-- `Hello` now carries a reserved `u32` extension word; version 1 senders set it to zero and receivers reject nonzero values
+- Control frames are incompatible with 0.1.0. Protocol version remains 1 and ALPN remains `ssxpro/1`. Every control frame except `Close` ends with a reserved `u32` extension word: senders set it to zero and receivers reject a nonzero value. `Hello` is 10 bytes and carries the compression feature bits. `AuthChallenge` is 37 bytes: the 32-byte server nonce, the selected compression algorithm, and the extension word. The Ed25519 authentication proof is unchanged.
+- Updated the protocol specification, configuration reference, and example `ssxd.yaml` with the compression settings
 
 ## [0.1.0] - 2026-11-07
 

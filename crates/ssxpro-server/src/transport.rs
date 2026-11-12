@@ -1142,6 +1142,7 @@ fn process_control(
                     getrandom(&mut nonce)?;
                     peer.server_nonce = Some(nonce);
                     let response = Message::Challenge {
+                        extension: RESERVED_EXTENSION,
                         server_nonce: nonce,
                         compression: selected,
                     };
@@ -1160,6 +1161,7 @@ fn process_control(
                     public_key,
                     client_nonce,
                     signature,
+                    ..
                 } => {
                     let name = std::str::from_utf8(&user[..usize::from(user_len)])?;
                     debug1!(
@@ -1198,6 +1200,7 @@ fn process_control(
                     term_len,
                     rows,
                     cols,
+                    ..
                 } if peer.authenticated => {
                     let name = peer
                         .identity
@@ -1242,7 +1245,7 @@ fn process_control(
                     peer.session_request_id = Some(request_id);
                     pending_sessions.insert(request_id, connection_key.to_vec());
                 }
-                Message::Resize { rows, cols } if peer.authenticated => {
+                Message::Resize { rows, cols, .. } if peer.authenticated => {
                     if rows > peer.max_rows || cols > peer.max_columns {
                         return Err("requested terminal dimensions exceed server policy".into());
                     }
@@ -1250,7 +1253,7 @@ fn process_control(
                         session.resize(rows, cols)?;
                     }
                 }
-                Message::Signal { signal } if peer.authenticated => {
+                Message::Signal { signal, .. } if peer.authenticated => {
                     if let Some(session) = &peer.pty {
                         let mut frame = [0u8; MAX_BROKER_FRAME];
                         let length =
@@ -1670,7 +1673,11 @@ fn pump_pty(peer: &mut PeerSession) -> Result<(), Box<dyn std::error::Error>> {
             && peer.pty_pending.is_empty()
             && !peer.conn.is_closed()
         {
-            let exit = Message::Exit { kind, value };
+            let exit = Message::Exit {
+                extension: RESERVED_EXTENSION,
+                kind,
+                value,
+            };
             send_control(&mut peer.conn, &exit)?;
             peer.state.sent(&exit)?;
             peer.conn.stream_send(4, &[], true)?;
@@ -1867,8 +1874,15 @@ fn complete_authorization(
     peer.authenticated = true;
     peer.identity = Some(login.identity);
     peer.session_token = Some(login.token);
-    send_control(&mut peer.conn, &Message::AuthOk)?;
-    peer.state.sent(&Message::AuthOk)?;
+    send_control(
+        &mut peer.conn,
+        &Message::AuthOk {
+            extension: RESERVED_EXTENSION,
+        },
+    )?;
+    peer.state.sent(&Message::AuthOk {
+        extension: RESERVED_EXTENSION,
+    })?;
     Ok(())
 }
 
