@@ -11,6 +11,12 @@ Both programs deserialize YAML into strict, typed structures. Unknown keys and w
 ```yaml
 listen: "0.0.0.0:22"
 host_key: /etc/ssx/host_ed25519
+# PTY stream compression, enforced by the server:
+#   off      - no compression
+#   fast     - LZ4, optimized for low CPU utilization
+#   standard - Snappy
+#   high     - Zstd level 19
+compression: off
 workers: 1 # Example; omitted workers defaults to the number of available CPUs
 io:
   ring_entries: 4096
@@ -90,6 +96,19 @@ QUIC PING frames are the keepalive mechanism (there is no TCP keepalive in QUIC)
 
 * `ssxd`: `quic.keep_alive_interval_secs` (default 15, `0` disables) sends a PING when a session has been quiet for a full interval, keeping NAT bindings and the connection alive.
 * `ssx`: `server_alive_interval_secs` (default 15, `0` disables, SSH `ServerAliveInterval`) sends a PING when no packet has been received for a full interval. After `server_alive_count_max` (default 6, SSH `ServerAliveCountMax`) unanswered PINGs, the client disconnects with exit code 255 and `server did not answer N keepalives; disconnecting`.
+
+## Compression
+
+Compression is enforced by `ssxd` and applies only to the stream-4 PTY data. Control frames are never compressed. The client advertises which algorithms its build supports in `Hello`; the server selects its configured mode in `AuthChallenge`. If the client does not support the configured algorithm, the connection is rejected rather than silently downgraded.
+
+| `compression` | Algorithm | Intended use |
+|---|---|---|
+| `off` (default) | none | lowest latency and zero added CPU |
+| `fast` | LZ4 | low CPU utilization |
+| `standard` | Snappy | balanced |
+| `high` | Zstd level 19 | maximum ratio, highest CPU cost |
+
+When enabled, each direction sends self-contained frames after the one-byte stream-4 open marker. A frame is `format:u8`, uncompressed length `u32be`, payload length `u32be`, then the payload. Stored blocks are used when compression would expand the data. Blocks are limited to 64 KiB uncompressed, so a peer cannot force unbounded allocations.
 
 ## `ssxd --check-config` exit codes
 

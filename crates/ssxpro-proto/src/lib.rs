@@ -26,6 +26,56 @@ pub const MAX_BROKER_TERM: usize = 64;
 pub const MAX_BROKER_FRAME: usize = 16 * 1024;
 pub const MAX_TERMINAL_DIMENSION: u16 = 4096;
 
+/// Client feature bit: supports LZ4 framed stream compression.
+pub const FEATURE_COMPRESSION_LZ4: u32 = 1 << 0;
+/// Client feature bit: supports Snappy framed stream compression.
+pub const FEATURE_COMPRESSION_SNAPPY: u32 = 1 << 1;
+/// Client feature bit: supports Zstd framed stream compression.
+pub const FEATURE_COMPRESSION_ZSTD: u32 = 1 << 2;
+/// Every feature bit understood by protocol version 1.
+pub const SUPPORTED_FEATURES: u32 =
+    FEATURE_COMPRESSION_LZ4 | FEATURE_COMPRESSION_SNAPPY | FEATURE_COMPRESSION_ZSTD;
+
+/// Compression selected by the server in `AuthChallenge`. The server
+/// configuration is authoritative; the client only advertises which algorithms
+/// its build supports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Compression {
+    Off = 0,
+    /// LZ4, optimized for low CPU utilization.
+    Fast = 1,
+    /// Snappy.
+    Standard = 2,
+    /// Zstd level 19.
+    High = 3,
+}
+
+impl Compression {
+    pub const fn feature_bit(self) -> u32 {
+        match self {
+            Self::Off => 0,
+            Self::Fast => FEATURE_COMPRESSION_LZ4,
+            Self::Standard => FEATURE_COMPRESSION_SNAPPY,
+            Self::High => FEATURE_COMPRESSION_ZSTD,
+        }
+    }
+
+    pub fn is_supported_by(self, features: u32) -> bool {
+        self == Self::Off || features & self.feature_bit() != 0
+    }
+
+    pub fn from_u8(value: u8) -> Option<Self> {
+        Some(match value {
+            0 => Self::Off,
+            1 => Self::Fast,
+            2 => Self::Standard,
+            3 => Self::High,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MonitorFrameError {
     Truncated,
@@ -810,6 +860,7 @@ pub enum Message {
     },
     Challenge {
         server_nonce: [u8; 32],
+        compression: Compression,
     },
     AuthRequest {
         user: [u8; 256],
@@ -890,7 +941,7 @@ impl std::error::Error for ProtocolError {}
 pub fn encode(message: &Message, out: &mut [u8; MAX_WIRE_FRAME]) -> Result<usize, ProtocolError> {
     let (kind, payload_len) = match message {
         Message::Hello { .. } => (0, 6),
-        Message::Challenge { .. } => (1, 32),
+        Message::Challenge { .. } => (1, 33),
         Message::AuthRequest { user, user_len, .. }
             if usize::from(*user_len) <= 256 && valid_user(&user[..usize::from(*user_len)]) =>
         {
@@ -930,7 +981,13 @@ pub fn encode(message: &Message, out: &mut [u8; MAX_WIRE_FRAME]) -> Result<usize
             p[..2].copy_from_slice(&version.to_be_bytes());
             p[2..].copy_from_slice(&features.to_be_bytes());
         }
-        Message::Challenge { server_nonce } => p.copy_from_slice(server_nonce),
+        Message::Challenge {
+            server_nonce,
+            compression,
+        } => {
+            p[..32].copy_from_slice(server_nonce);
+            p[32] = *compression as u8;
+        }
         Message::AuthRequest {
             user,
             user_len,
@@ -1007,8 +1064,9 @@ pub fn decode(input: &[u8]) -> Result<(Message, usize), ProtocolError> {
             version: u16::from_be_bytes([p[0], p[1]]),
             features: u32::from_be_bytes(p[2..6].try_into().unwrap()),
         },
-        1 if len == 32 => Message::Challenge {
-            server_nonce: p.try_into().unwrap(),
+        1 if len == 33 => Message::Challenge {
+            server_nonce: p[..32].try_into().unwrap(),
+            compression: Compression::from_u8(p[32]).ok_or(ProtocolError::InvalidPayload)?,
         },
         2 if len >= 130 => {
             let n = u16::from_be_bytes([p[0], p[1]]) as usize;
@@ -1257,6 +1315,39 @@ impl ServerState {
 mod tests {
     use super::*;
     #[test]
+    fn compression_feature_bits_match_server_selection() {
+        assert_eq!(
+            SUPPORTED_FEATURES,
+            FEATURE_COMPRESSION_LZ4 | FEATURE_COMPRESSION_SNAPPY | FEATURE_COMPRESSION_ZSTD
+        );
+        for compression in [Compression::Fast, Compression::Standard, Compression::High] {
+            assert!(compression.is_supported_by(SUPPORTED_FEATURES));
+            assert!(!compression.is_supported_by(0));
+            assert!(!compression.is_supported_by(SUPPORTED_FEATURES & !compression.feature_bit()));
+        }
+        assert!(Compression::Off.is_supported_by(0));
+        assert_eq!(Compression::from_u8(0), Some(Compression::Off));
+        assert_eq!(Compression::from_u8(3), Some(Compression::High));
+        assert_eq!(Compression::from_u8(4), None);
+    }
+
+    #[test]
+    fn invalid_compression_id_is_rejected() {
+        let message = Message::Challenge {
+            server_nonce: [0; 32],
+            compression: Compression::Fast,
+        };
+        let mut frame = [0u8; MAX_WIRE_FRAME];
+        let length = encode(&message, &mut frame).unwrap();
+        assert_eq!(length, 3 + 33);
+        frame[length - 1] = 4;
+        assert_eq!(
+            decode(&frame[..length]).unwrap_err(),
+            ProtocolError::InvalidPayload
+        );
+    }
+
+    #[test]
     fn usernames_require_utf8_and_no_controls() {
         assert!(valid_user("josé".as_bytes()));
         for user in [&b""[..], &b"bad\0name"[..], &b"bad\nname"[..], &[0xff][..]] {
@@ -1302,6 +1393,7 @@ mod tests {
             },
             Message::Challenge {
                 server_nonce: [7; 32],
+                compression: Compression::High,
             },
             Message::AuthOk,
             Message::AuthFail { reason_class: 2 },
@@ -1457,6 +1549,7 @@ mod tests {
         state
             .accept(&Message::Challenge {
                 server_nonce: [0; 32],
+                compression: Compression::Off,
             })
             .unwrap();
         let auth = Message::AuthRequest {

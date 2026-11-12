@@ -7,6 +7,13 @@ The script drives the client over a real PTY and verifies:
   B. remote exit status propagation (``exit 7`` -> client exit 7)
   C. authentication rejection with an unauthorized identity
   D. host key mismatch against a pinned known_hosts is a hard failure
+  E. idle sessions survive a quiet period thanks to keepalives
+  F. the server-selected compression mode reaches the client
+  G. bulk data crosses the stream-4 compressor in both directions
+
+Set ``SSX_E2E_COMPRESSION`` to the server's configured mode (``off``,
+``fast``, ``standard`` or ``high``) so scenario F can verify the negotiated
+algorithm. ``tests/bootstrap.sh`` exports it from ``SSXD_COMPRESSION``.
 
 Prerequisites
 -------------
@@ -18,6 +25,8 @@ Prerequisites
 * The server's key pin exists at ``SSX_E2E_KNOWN_HOSTS``
   (default ``~/.ssx/known_hosts``); connect once with
   ``--approve-host`` or the default client config to create it.
+* The remote account's shell has ``seq`` and ``sha256sum`` for the bulk
+  compression scenario.
 
 The test does not start or stop servers; it only drives clients. All artifacts
 are written under ``target/e2e`` unless ``SSX_E2E_WORK`` is set.
@@ -29,6 +38,7 @@ Usage::
 
 import base64
 import errno
+import hashlib
 import os
 import pty
 import re
@@ -44,6 +54,13 @@ SSX = Path(os.environ.get("SSX_BIN", REPO / "target" / "debug" / "ssx"))
 HOST = os.environ.get("SSX_E2E_HOST", "127.0.0.1")
 PORT = int(os.environ.get("SSX_E2E_PORT", "2222"))
 USER = os.environ.get("SSX_E2E_USER", os.environ.get("USER", "root"))
+COMPRESSION = os.environ.get("SSX_E2E_COMPRESSION", "off")
+COMPRESSION_NAMES = {
+    "off": "Off",
+    "fast": "Fast",
+    "standard": "Standard",
+    "high": "High",
+}
 IDENTITY_SOURCE = Path(
     os.environ.get("SSX_E2E_IDENTITY", Path.home() / ".ssx" / "id_ed25519")
 )
@@ -57,6 +74,16 @@ KNOWN_HOSTS = WORK / "known_hosts"
 WRONG_KNOWN_HOSTS = WORK / "known_hosts.wrong"
 UNAUTHORIZED_KEY = WORK / "unauthorized_ed25519"
 IDENTITY = WORK / "id_ed25519"
+
+# Bulk-data scenario: enough server output to span multiple 64 KiB frames
+# and enough client input to span multiple compressed frames in the other
+# direction. Input is sent as canonical lines so it works with any login
+# shell, including fish; each line stays below the 4096-byte MAX_CANON limit.
+BULK_LINES = 20_000
+BULK_INPUT_LINES = 64
+BULK_INPUT_LINE = (b"ssxpro-compression " * 200)[:2047] + b"\n"
+BULK_INPUT = BULK_INPUT_LINE * BULK_INPUT_LINES
+BULK_INPUT_DIGEST = hashlib.sha256(BULK_INPUT).hexdigest()
 
 CONFIG_TEMPLATE = """hosts: {{}}
 identity: "{identity}"
@@ -101,11 +128,9 @@ class PtySession:
             os.environ["TERM"] = "xterm-256color"
             os.execv(SSX, [str(SSX)] + argv)
         self.output = b""
+        self.answer_queries = True
 
-    def _pump_once(self, timeout):
-        ready, _, _ = select.select([self.fd], [], [], timeout)
-        if not ready:
-            return False
+    def _read_chunk(self):
         try:
             chunk = os.read(self.fd, 65536)
         except OSError as exc:
@@ -115,12 +140,19 @@ class PtySession:
         if not chunk:
             return False
         self.output += chunk
-        # Answer basic terminal queries so fish does not stall for 10 seconds.
-        if b"\x1b[c" in chunk:
-            os.write(self.fd, b"\x1b[?62;c")
-        if b"\x1b[6n" in chunk:
-            os.write(self.fd, b"\x1b[1;1R")
+        if self.answer_queries:
+            # Answer basic terminal queries so fish does not stall for 10 seconds.
+            if b"\x1b[c" in chunk:
+                os.write(self.fd, b"\x1b[?62;c")
+            if b"\x1b[6n" in chunk:
+                os.write(self.fd, b"\x1b[1;1R")
         return True
+
+    def _pump_once(self, timeout):
+        ready, _, _ = select.select([self.fd], [], [], timeout)
+        if not ready:
+            return False
+        return self._read_chunk()
 
     def wait_for(self, needle, timeout=30):
         deadline = time.time() + timeout
@@ -134,7 +166,19 @@ class PtySession:
         return False
 
     def send(self, data):
-        os.write(self.fd, data)
+        # Bulk input can exceed both the local and remote PTY buffers. Keep
+        # draining client output while writing so neither side can deadlock.
+        view = memoryview(data)
+        while view:
+            readable, writable, _ = select.select([self.fd], [self.fd], [], 0.25)
+            if readable:
+                self._read_chunk()
+            if not writable:
+                continue
+            written = os.write(self.fd, view[:4096])
+            if written == 0:
+                raise OSError("short write to PTY")
+            view = view[written:]
 
     def wait_exit(self, timeout=30):
         deadline = time.time() + timeout
@@ -166,10 +210,14 @@ def run_scenario(name, argv, steps, expect_status, expect_output=(), forbid_outp
       * ``("text", data)``  - wait, then send data
       * ``(None, data)``    - send data without waiting
       * a number           - sleep that many seconds
+      * a callable         - call it with the session (for mode toggles)
     """
     session = PtySession(argv)
     ok = True
     for step in steps:
+        if callable(step):
+            step(session)
+            continue
         if isinstance(step, (int, float)):
             time.sleep(step)
             continue
@@ -210,6 +258,14 @@ def main():
         return 2
     if not KNOWN_HOSTS_SOURCE.exists():
         print(f"known_hosts not found: {KNOWN_HOSTS_SOURCE}", file=sys.stderr)
+        return 2
+    if COMPRESSION not in COMPRESSION_NAMES:
+        print(
+            "SSX_E2E_COMPRESSION must be one of: "
+            + ", ".join(COMPRESSION_NAMES)
+            + f" (got {COMPRESSION!r})",
+            file=sys.stderr,
+        )
         return 2
 
     WORK.mkdir(parents=True, exist_ok=True)
@@ -263,6 +319,50 @@ def main():
             [("terminal raw mode enabled", b"printf 'SSX_%s\\n' READY\r"), ("SSX_READY", b"exit 7\r")],
             expect_status=7,
             expect_output=("kind=Status, value=7",),
+        )
+    )
+
+    compression_name = COMPRESSION_NAMES[COMPRESSION]
+    compression_expected = [f"compression={compression_name}"]
+    compression_forbidden = []
+    if COMPRESSION == "off":
+        compression_forbidden.append("stream compression enabled (")
+    else:
+        compression_expected.append(f"stream compression enabled ({compression_name})")
+    results.append(
+        run_scenario(
+            "F-compression-negotiation",
+            base,
+            [("terminal raw mode enabled", b"exit\r")],
+            expect_status=0,
+            expect_output=compression_expected,
+            forbid_output=compression_forbidden,
+        )
+    )
+
+    bulk_command = (
+        b"seq 1 "
+        + str(BULK_LINES).encode()
+        + b"; printf 'SEQ_%s\\n' DONE\r"
+        b"printf 'BULK_%s\\n' READY; sha256sum; printf 'BULK_%s\\n' DONE\r"
+    )
+    results.append(
+        run_scenario(
+            "G-compression-bulk-data",
+            base,
+            [
+                ("terminal raw mode enabled", b"printf 'SSX_%s\\n' READY\r"),
+                ("SSX_READY", None),
+                lambda session: setattr(session, "answer_queries", False),
+                (None, bulk_command),
+                ("SEQ_DONE", None),
+                ("BULK_READY", BULK_INPUT + b"\x04"),
+                (BULK_INPUT_DIGEST, None),
+                lambda session: setattr(session, "answer_queries", True),
+                ("BULK_DONE", b"exit\r"),
+            ],
+            expect_status=0,
+            expect_output=("SEQ_DONE", "BULK_DONE", BULK_INPUT_DIGEST, "kind=Status, value=0"),
         )
     )
 
