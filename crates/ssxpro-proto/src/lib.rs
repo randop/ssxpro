@@ -4,7 +4,9 @@
 
 pub const MAX_FRAME: usize = 4096;
 pub const MAX_WIRE_FRAME: usize = MAX_FRAME + 10;
-pub const ALPN: &[u8] = b"ssxpro/2";
+/// The only wire protocol version supported by this release.
+pub const PROTOCOL_VERSION: u16 = 1;
+pub const ALPN: &[u8] = b"ssxpro/1";
 pub const MAX_MONITOR_SIGN_INPUT: usize = 8192;
 pub const MAX_MONITOR_FRAME: usize = 7 + MAX_MONITOR_SIGN_INPUT;
 pub const MAX_MONITOR_USER: usize = 256;
@@ -1251,7 +1253,13 @@ pub enum ServerState {
 impl ClientState {
     pub fn sent(&mut self, m: &Message) -> Result<(), ProtocolError> {
         *self = match (*self, m) {
-            (Self::Start, Message::Hello { version: 2, .. }) => Self::AwaitChallenge,
+            (
+                Self::Start,
+                Message::Hello {
+                    version: PROTOCOL_VERSION,
+                    ..
+                },
+            ) => Self::AwaitChallenge,
             (Self::AwaitAuth, Message::AuthRequest { .. }) => Self::AwaitAuthResult,
             (Self::Ready, Message::OpenShell { .. }) => Self::Running,
             (Self::Running, Message::Resize { .. } | Message::Signal { .. }) => Self::Running,
@@ -1300,7 +1308,13 @@ impl ServerState {
 
     pub fn accept(&mut self, m: &Message) -> Result<(), ProtocolError> {
         *self = match (*self, m) {
-            (Self::Start, Message::Hello { version: 2, .. }) => Self::AwaitAuth,
+            (
+                Self::Start,
+                Message::Hello {
+                    version: PROTOCOL_VERSION,
+                    ..
+                },
+            ) => Self::AwaitAuth,
             (Self::AwaitAuth, Message::AuthRequest { .. }) => Self::AuthPending,
             (Self::AwaitOpen, Message::OpenShell { .. }) => Self::Running,
             (Self::Running, Message::Resize { .. } | Message::Signal { .. }) => Self::Running,
@@ -1332,14 +1346,20 @@ mod tests {
     }
 
     #[test]
-    fn compression_protocol_has_a_distinct_version() {
-        assert_eq!(ALPN, b"ssxpro/2");
-        let legacy = Message::Hello {
-            version: 1,
+    fn protocol_is_version_one() {
+        assert_eq!(ALPN, b"ssxpro/1");
+        let hello = Message::Hello {
+            version: PROTOCOL_VERSION,
             features: 0,
         };
-        assert!(ServerState::Start.accept(&legacy).is_err());
-        assert!(ClientState::Start.sent(&legacy).is_err());
+        assert!(ServerState::Start.accept(&hello).is_ok());
+        assert!(ClientState::Start.sent(&hello).is_ok());
+        let unsupported = Message::Hello {
+            version: PROTOCOL_VERSION + 1,
+            features: 0,
+        };
+        assert!(ServerState::Start.accept(&unsupported).is_err());
+        assert!(ClientState::Start.sent(&unsupported).is_err());
     }
 
     #[test]
@@ -1399,7 +1419,7 @@ mod tests {
     fn message_round_trips() {
         let messages = [
             Message::Hello {
-                version: 2,
+                version: PROTOCOL_VERSION,
                 features: 0,
             },
             Message::Challenge {
@@ -1553,7 +1573,7 @@ mod tests {
         let mut state = ClientState::Start;
         state
             .sent(&Message::Hello {
-                version: 2,
+                version: PROTOCOL_VERSION,
                 features: 0,
             })
             .unwrap();

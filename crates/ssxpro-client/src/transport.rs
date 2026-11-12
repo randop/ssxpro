@@ -14,7 +14,7 @@ use ssxpro_crypto::{
 use ssxpro_io::{RuntimeRing, UdpEndpoint};
 use ssxpro_proto::{
     encode, ClientState, Compression, ExitKind, FrameDecoder, Message, MAX_WIRE_FRAME,
-    SUPPORTED_FEATURES,
+    PROTOCOL_VERSION, SUPPORTED_FEATURES,
 };
 use std::collections::VecDeque;
 use std::io::Write;
@@ -290,13 +290,13 @@ pub fn connect_and_echo(
         }
         if pin_checked && !sent_hello {
             let hello = Message::Hello {
-                version: 2,
+                version: PROTOCOL_VERSION,
                 features: SUPPORTED_FEATURES,
             };
             send_control(&mut conn, &hello)?;
             state.sent(&hello)?;
             sent_hello = true;
-            debug1!(verbose, "sent client hello (version=1)");
+            debug1!(verbose, "sent client hello (version={PROTOCOL_VERSION})");
         }
         flush(&mut conn, &endpoint, &mut ring, &mut output, verbose)?;
         match endpoint.recv_from(&mut ring, &mut packet) {

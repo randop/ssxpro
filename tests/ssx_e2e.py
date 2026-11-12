@@ -34,6 +34,10 @@ are written under ``target/e2e`` unless ``SSX_E2E_WORK`` is set.
 Usage::
 
     python3 tests/ssx_e2e.py
+    python3 tests/ssx_e2e.py --self-test
+
+``--self-test`` runs the driver's own failure-detection checks and needs no
+server or client.
 """
 
 import base64
@@ -46,7 +50,9 @@ import select
 import signal
 import sys
 import time
+import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 REPO = Path(__file__).resolve().parent.parent
 WORK = Path(os.environ.get("SSX_E2E_WORK", REPO / "target" / "e2e"))
@@ -277,6 +283,47 @@ def validate_bulk_output(output):
     return match is not None and match.group(1) == expected
 
 
+class BulkChecks(unittest.TestCase):
+    """Focused checks for the PTY test driver's failure detection."""
+
+    def test_exact_sequence_required(self):
+        lines = [f"{i}\r\n".encode() for i in range(1, BULK_LINES + 1)]
+
+        def wrap(values):
+            return (
+                b"prompt\r\n\x1b]3008;start=test\x1b\\SEQ_BEGIN\r\n"
+                + b"".join(values)
+                + b"SEQ_DONE\r\n"
+            )
+
+        self.assertTrue(validate_bulk_output(wrap(lines)))
+        self.assertFalse(validate_bulk_output(wrap(lines[:-1])))
+        changed = list(lines)
+        changed[100] = b"changed\r\n"
+        self.assertFalse(validate_bulk_output(wrap(changed)))
+        changed[100], changed[101] = lines[101], lines[100]
+        self.assertFalse(validate_bulk_output(wrap(changed)))
+
+    def test_send_deadline_restores_fd(self):
+        session = PtySession.__new__(PtySession)
+        session.fd = 42
+        with patch.object(os, "get_blocking", return_value=True), \
+             patch.object(os, "set_blocking") as mode, \
+             patch.object(time, "monotonic", side_effect=[0, 0, 31]), \
+             patch.object(select, "select", return_value=([], [], [])):
+            with self.assertRaises(TimeoutError):
+                session.send(b"bulk")
+            self.assertEqual(mode.call_args_list[-1].args, (42, True))
+
+    def test_send_timeout_uses_child_cleanup(self):
+        session = Mock(output=b"")
+        session.send.side_effect = TimeoutError("stalled")
+        session.wait_exit.return_value = 0
+        with patch.object(sys.modules[__name__], "PtySession", return_value=session):
+            self.assertFalse(run_scenario("timeout", [], [(None, b"bulk")], 0))
+        session.wait_exit.assert_called_once_with(timeout=30)
+
+
 def main():
     if not SSX.exists():
         print(f"client binary not found: {SSX} (build it or set SSX_BIN)", file=sys.stderr)
@@ -462,4 +509,8 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    if "--self-test" in sys.argv:
+        sys.argv.remove("--self-test")
+        unittest.main()
+    else:
+        sys.exit(main())

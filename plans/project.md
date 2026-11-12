@@ -19,7 +19,7 @@ Status: In progress (2026-11-12) — M0–M3 complete; M5 functional end-to-end 
 
 ## Progress snapshot (2026-11-12)
 
-**Working end to end.** `ssx` and `ssxd` complete a QUIC handshake (ALPN `ssxpro/2`) with Retry, pin the Ed25519 host SPKI, authenticate with a signed nonce, open a broker-created PTY login shell, carry interactive input/output over stream 4, and report the remote exit status. The workspace is at version `0.1.1`. Verified on the local dev host with `tests/ssx_e2e.py`:
+**Working end to end.** `ssx` and `ssxd` complete a QUIC handshake (ALPN `ssxpro/1`) with Retry, pin the Ed25519 host SPKI, authenticate with a signed nonce, open a broker-created PTY login shell, carry interactive input/output over stream 4, and report the remote exit status. The workspace is at version `0.1.1`. Verified on the local dev host with `tests/ssx_e2e.py`:
 
 * A. shell round-trip: login, command output, exit `0`
 * B. remote exit status: `exit 7` → client exit `7`
@@ -29,7 +29,7 @@ Status: In progress (2026-11-12) — M0–M3 complete; M5 functional end-to-end 
 * F. compression negotiation: the server-selected mode reaches the client, or `off` leaves stream 4 unframed
 * G. bulk compression data: multi-frame server output and client input round-trip through every configured mode
 
-**Server-enforced PTY compression (v0.1.1).** `ssxd.yaml` now has `compression: off|fast|standard|high`: `off` is raw stream-4 data, `fast` is LZ4, `standard` is Snappy, and `high` is Zstd level 19. The client advertises every supported algorithm in `Hello` feature bits; the server selects its configured mode in `AuthChallenge` and fails closed if the client does not advertise it. Compressed data uses bounded frames (`format`, uncompressed length, payload length) with stored-block fallback; control frames stay uncompressed. `tests/compression_e2e.sh` runs the full e2e suite against all four modes.
+**Server-enforced PTY compression (v0.1.1).** `ssxd.yaml` now has `compression: off|fast|standard|high`: `off` is raw stream-4 data, `fast` is LZ4, `standard` is Snappy, and `high` is Zstd level 19. The client advertises every supported algorithm in `Hello` feature bits; the server selects its configured mode in `AuthChallenge` and fails closed if the client does not advertise it. Compressed data uses bounded frames (`format`, uncompressed length, payload length) with stored-block fallback; control frames stay uncompressed. `tests/compression_e2e.sh` runs the full e2e suite against all four modes. The wire protocol is version 1 with ALPN `ssxpro/1`; compression is part of the initial release, so there is no legacy wire format to preserve.
 
 **Verified commands:** `cargo build --workspace --locked`, `cargo test --workspace --locked` (61 passed, 2 ignored), `cargo clippy --workspace --all-targets`, `cargo fmt --all -- --check`, `scripts/licenses.sh --check` — clean; `tests/compression_e2e.sh` — 7/7 scenarios in each of `off`, `fast`, `standard` and `high`.
 
@@ -48,7 +48,6 @@ Status: In progress (2026-11-12) — M0–M3 complete; M5 functional end-to-end 
 * The local dev host runs Linux 6.8 (below the 6.12 baseline) without Landlock. The PTY pump warns and continues with seccomp only; a fail-closed baseline probe is still required.
 * Unprivileged dev mode (`--yes-I-know-permission-risks-go-ahead-please`, broker already running as the target account) exists for local testing; production remains root plus strict permissions.
 * The GitHub CI workflow was removed from the tree. `fmt`/`clippy`/`test`/`audit`/`deny` run locally through `scripts/cargo-pinned.sh`; the kernel matrix job is only documented in `docs/ci-kernels.md`.
-* Compression uses protocol version 2 and ALPN `ssxpro/2`, with a 33-byte `AuthChallenge` even when compression is off. Clients and servers must be upgraded together; legacy `ssxpro/1` peers retain their 32-byte format and cannot negotiate with version 2.
 
 ## Architecture
 
@@ -219,7 +218,7 @@ The sans-IO wire protocol for both roles. No sockets, no allocation on the hot p
 
 ## Scope
 
-* ALPN `ssxpro/2`. Stream 0 is the control stream (high priority). Stream 4 is the PTY data stream; with compression `off` it is raw bytes, otherwise it carries bounded compressed frames selected by the server. QUIC flow control does the work in both cases.
+* ALPN `ssxpro/1`. Stream 0 is the control stream (high priority). Stream 4 is the PTY data stream; with compression `off` it is raw bytes, otherwise it carries bounded compressed frames selected by the server. QUIC flow control does the work in both cases.
 * Control frames: varint type, length-prefixed, bounded fields, **max 4 KiB**.
   * `Hello{version, features}`
   * `AuthChallenge{server_nonce, compression}`

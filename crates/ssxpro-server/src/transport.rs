@@ -5,7 +5,7 @@ use ssxpro_io::{RuntimeRing, UdpEndpoint};
 use ssxpro_proto::{
     decode_broker_response, encode, encode_broker_close_request, encode_broker_open_request,
     encode_broker_signal_request, BrokerResponse, BrokerStatus, Compression, FrameDecoder, Message,
-    ServerState, MAX_BROKER_FRAME, MAX_WIRE_FRAME, SUPPORTED_FEATURES,
+    ServerState, MAX_BROKER_FRAME, MAX_WIRE_FRAME, PROTOCOL_VERSION, SUPPORTED_FEATURES,
 };
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Shutdown, SocketAddr};
@@ -1117,7 +1117,7 @@ fn process_control(
             peer.state.accept(&message)?;
             match message {
                 Message::Hello {
-                    version: 2,
+                    version: PROTOCOL_VERSION,
                     features,
                 } => {
                     let selected = negotiate_compression(configured_compression, features)?;

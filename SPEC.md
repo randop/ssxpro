@@ -7,13 +7,13 @@
 # ssxpro protocol and security specification
 
 Status: M0 baseline (2026-11-04)  
-Protocol version: 2<br>
-ALPN: `ssxpro/2`<br>
+Protocol version: 1<br>
+ALPN: `ssxpro/1`<br>
 Transport: QUIC over UDP, normally port 22. This is a new protocol and is not SSH.
 
-## Upgrade compatibility
+## Protocol versioning
 
-Version 2 requires ALPN `ssxpro/2` and Hello version 2. Its AuthChallenge is 33 bytes (32-byte nonce plus compression selector), including when compression is off. Version 1 retains its established 32-byte AuthChallenge; this implementation does not negotiate `ssxpro/1`. Clients and servers must be upgraded together, including deployments with compression off. Mixed versions fail ALPN negotiation. The authentication proof construction remains unchanged.
+Version 1 requires ALPN `ssxpro/1` and Hello version 1. Its AuthChallenge is 33 bytes (32-byte nonce plus compression selector), including when compression is off. This is the initial release, so there are no legacy peers or compatibility modes; clients and servers must use this version. Mixed versions fail ALPN negotiation. The authentication proof construction remains unchanged.
 
 ## Goals and non-goals
 
@@ -23,7 +23,7 @@ ssxpro provides public-key authenticated interactive login to one PTY-backed log
 
 QUIC provides confidentiality, integrity, peer transport authentication, stream ordering, and flow control. TLS 1.3 is carried inside QUIC by quiche/BoringSSL; there is no second encryption layer.
 
-The client negotiates ALPN `ssxpro/2`. Stream 0 is the bidirectional control stream. Stream 4 is a bidirectional byte stream for PTY data. The client opens stream 4 immediately after `OpenShell` with a single 0x00 open marker; the server discards exactly that first byte. All remaining stream-4 bytes carry PTY data, either raw or in compression frames when the server selected a compression mode. QUIC flow control supplies backpressure. A stream 4 whose first byte is not 0x00, or a FIN before the marker, is a protocol error. All other stream IDs are forbidden in v2. The control stream is opened first and has priority over PTY data.
+The client negotiates ALPN `ssxpro/1`. Stream 0 is the bidirectional control stream. Stream 4 is a bidirectional byte stream for PTY data. The client opens stream 4 immediately after `OpenShell` with a single 0x00 open marker; the server discards exactly that first byte. All remaining stream-4 bytes carry PTY data, either raw or in compression frames when the server selected a compression mode. QUIC flow control supplies backpressure. A stream 4 whose first byte is not 0x00, or a FIN before the marker, is a protocol error. All other stream IDs are forbidden in v1. The control stream is opened first and has priority over PTY data.
 
 Control frames are `type` followed by `length` followed by `payload`. `type` is a QUIC varint; `length` is an unsigned big-endian 16-bit byte count. The payload is at most 4096 bytes. Integers in payloads are unsigned big-endian unless stated otherwise. Strings are UTF-8, nonempty where required, and contain no NUL. Decoders reject trailing bytes, invalid UTF-8, noncanonical/overflowing integer encodings, unknown message types, and lengths above the bound. A frame is not acted on until its full declared payload has arrived.
 
@@ -33,7 +33,7 @@ Control frames are `type` followed by `length` followed by `payload`. `type` is 
 
 | Type | Direction | Payload |
 |---|---|---|
-| 0x00 `Hello` | client→server | version u16 (=2), feature bits u32 (unknown bits rejected); bits 0–2 advertise LZ4, Snappy and Zstd stream compression support |
+| 0x00 `Hello` | client→server | version u16 (=1), feature bits u32 (unknown bits rejected); bits 0–2 advertise LZ4, Snappy and Zstd stream compression support |
 | 0x01 `AuthChallenge` | server→client | 32-byte unpredictable server nonce, selected compression u8 (0=off, 1=LZ4, 2=Snappy, 3=Zstd) |
 | 0x02 `AuthRequest` | client→server | username (u16 length + UTF-8), Ed25519 public key (32), client nonce (32), signature (64) |
 | 0x03 `AuthOk` | server→client | empty |
