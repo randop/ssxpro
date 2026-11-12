@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Updated protocol specification, configuration reference, and example `ssxd.yaml` with compression settings
 - `AuthChallenge` now carries the selected stream-compression algorithm
+- `Hello` now carries a reserved `u32` extension word; version 1 senders set it to zero and receivers reject nonzero values
 
 ## [0.1.0] - 2026-11-07
 

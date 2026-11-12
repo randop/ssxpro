@@ -14,7 +14,7 @@ use ssxpro_crypto::{
 use ssxpro_io::{RuntimeRing, UdpEndpoint};
 use ssxpro_proto::{
     encode, ClientState, Compression, ExitKind, FrameDecoder, Message, MAX_WIRE_FRAME,
-    PROTOCOL_VERSION, SUPPORTED_FEATURES,
+    PROTOCOL_VERSION, RESERVED_EXTENSION, SUPPORTED_FEATURES,
 };
 use std::collections::VecDeque;
 use std::io::Write;
@@ -292,6 +292,7 @@ pub fn connect_and_echo(
             let hello = Message::Hello {
                 version: PROTOCOL_VERSION,
                 features: SUPPORTED_FEATURES,
+                extension: RESERVED_EXTENSION,
             };
             send_control(&mut conn, &hello)?;
             state.sent(&hello)?;

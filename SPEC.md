@@ -13,7 +13,7 @@ Transport: QUIC over UDP, normally port 22. This is a new protocol and is not SS
 
 ## Protocol versioning
 
-Version 1 requires ALPN `ssxpro/1` and Hello version 1. Its AuthChallenge is 33 bytes (32-byte nonce plus compression selector), including when compression is off. This is the initial release, so there are no legacy peers or compatibility modes; clients and servers must use this version. Mixed versions fail ALPN negotiation. The authentication proof construction remains unchanged.
+Version 1 requires ALPN `ssxpro/1` and Hello version 1. Its AuthChallenge is 33 bytes (32-byte nonce plus compression selector), including when compression is off. Hello also carries a reserved `u32` extension word: version 1 senders set it to zero, and receivers reject any nonzero value until a future version defines it. This is the initial release, so there are no legacy peers or compatibility modes; clients and servers must use this version. Mixed versions fail ALPN negotiation. The authentication proof construction remains unchanged.
 
 ## Goals and non-goals
 
@@ -33,7 +33,7 @@ Control frames are `type` followed by `length` followed by `payload`. `type` is 
 
 | Type | Direction | Payload |
 |---|---|---|
-| 0x00 `Hello` | client→server | version u16 (=1), feature bits u32 (unknown bits rejected); bits 0–2 advertise LZ4, Snappy and Zstd stream compression support |
+| 0x00 `Hello` | client→server | version u16 (=1), feature bits u32 (unknown bits rejected), reserved extension u32 (=0; nonzero rejected); bits 0–2 advertise LZ4, Snappy and Zstd stream compression support |
 | 0x01 `AuthChallenge` | server→client | 32-byte unpredictable server nonce, selected compression u8 (0=off, 1=LZ4, 2=Snappy, 3=Zstd) |
 | 0x02 `AuthRequest` | client→server | username (u16 length + UTF-8), Ed25519 public key (32), client nonce (32), signature (64) |
 | 0x03 `AuthOk` | server→client | empty |

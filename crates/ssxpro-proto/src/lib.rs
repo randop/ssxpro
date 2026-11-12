@@ -6,6 +6,9 @@ pub const MAX_FRAME: usize = 4096;
 pub const MAX_WIRE_FRAME: usize = MAX_FRAME + 10;
 /// The only wire protocol version supported by this release.
 pub const PROTOCOL_VERSION: u16 = 1;
+/// Reserved Hello extension word. Version 1 senders set it to zero and
+/// receivers reject any other value until a future version defines it.
+pub const RESERVED_EXTENSION: u32 = 0;
 pub const ALPN: &[u8] = b"ssxpro/1";
 pub const MAX_MONITOR_SIGN_INPUT: usize = 8192;
 pub const MAX_MONITOR_FRAME: usize = 7 + MAX_MONITOR_SIGN_INPUT;
@@ -859,6 +862,7 @@ pub enum Message {
     Hello {
         version: u16,
         features: u32,
+        extension: u32,
     },
     Challenge {
         server_nonce: [u8; 32],
@@ -942,7 +946,8 @@ impl std::error::Error for ProtocolError {}
 
 pub fn encode(message: &Message, out: &mut [u8; MAX_WIRE_FRAME]) -> Result<usize, ProtocolError> {
     let (kind, payload_len) = match message {
-        Message::Hello { .. } => (0, 6),
+        Message::Hello { extension, .. } if *extension == RESERVED_EXTENSION => (0, 10),
+        Message::Hello { .. } => return Err(ProtocolError::InvalidPayload),
         Message::Challenge { .. } => (1, 33),
         Message::AuthRequest { user, user_len, .. }
             if usize::from(*user_len) <= 256 && valid_user(&user[..usize::from(*user_len)]) =>
@@ -979,9 +984,14 @@ pub fn encode(message: &Message, out: &mut [u8; MAX_WIRE_FRAME]) -> Result<usize
     cursor += 2;
     let p = &mut out[cursor..cursor + payload_len];
     match message {
-        Message::Hello { version, features } => {
+        Message::Hello {
+            version,
+            features,
+            extension,
+        } => {
             p[..2].copy_from_slice(&version.to_be_bytes());
-            p[2..].copy_from_slice(&features.to_be_bytes());
+            p[2..6].copy_from_slice(&features.to_be_bytes());
+            p[6..10].copy_from_slice(&extension.to_be_bytes());
         }
         Message::Challenge {
             server_nonce,
@@ -1062,10 +1072,17 @@ pub fn decode(input: &[u8]) -> Result<(Message, usize), ProtocolError> {
     }
     let p = &input[head + 2..head + 2 + len];
     let msg = match kind {
-        0 if len == 6 => Message::Hello {
-            version: u16::from_be_bytes([p[0], p[1]]),
-            features: u32::from_be_bytes(p[2..6].try_into().unwrap()),
-        },
+        0 if len == 10 => {
+            let extension = u32::from_be_bytes(p[6..10].try_into().unwrap());
+            if extension != RESERVED_EXTENSION {
+                return Err(ProtocolError::InvalidPayload);
+            }
+            Message::Hello {
+                version: u16::from_be_bytes([p[0], p[1]]),
+                features: u32::from_be_bytes(p[2..6].try_into().unwrap()),
+                extension,
+            }
+        }
         1 if len == 33 => Message::Challenge {
             server_nonce: p[..32].try_into().unwrap(),
             compression: Compression::from_u8(p[32]).ok_or(ProtocolError::InvalidPayload)?,
@@ -1257,6 +1274,7 @@ impl ClientState {
                 Self::Start,
                 Message::Hello {
                     version: PROTOCOL_VERSION,
+                    extension: RESERVED_EXTENSION,
                     ..
                 },
             ) => Self::AwaitChallenge,
@@ -1312,6 +1330,7 @@ impl ServerState {
                 Self::Start,
                 Message::Hello {
                     version: PROTOCOL_VERSION,
+                    extension: RESERVED_EXTENSION,
                     ..
                 },
             ) => Self::AwaitAuth,
@@ -1351,15 +1370,58 @@ mod tests {
         let hello = Message::Hello {
             version: PROTOCOL_VERSION,
             features: 0,
+            extension: RESERVED_EXTENSION,
         };
         assert!(ServerState::Start.accept(&hello).is_ok());
         assert!(ClientState::Start.sent(&hello).is_ok());
         let unsupported = Message::Hello {
             version: PROTOCOL_VERSION + 1,
             features: 0,
+            extension: RESERVED_EXTENSION,
         };
         assert!(ServerState::Start.accept(&unsupported).is_err());
         assert!(ClientState::Start.sent(&unsupported).is_err());
+    }
+
+    #[test]
+    fn reserved_extension_must_be_zero() {
+        assert_eq!(RESERVED_EXTENSION, 0);
+        let hello = Message::Hello {
+            version: PROTOCOL_VERSION,
+            features: SUPPORTED_FEATURES,
+            extension: RESERVED_EXTENSION,
+        };
+        let mut frame = [0u8; MAX_WIRE_FRAME];
+        let length = encode(&hello, &mut frame).unwrap();
+        assert_eq!(length, 3 + 10);
+        assert_eq!(&frame[3..5], &PROTOCOL_VERSION.to_be_bytes());
+        assert_eq!(&frame[5..9], &SUPPORTED_FEATURES.to_be_bytes());
+        assert_eq!(&frame[9..13], &RESERVED_EXTENSION.to_be_bytes());
+        assert_eq!(decode(&frame[..length]).unwrap(), (hello.clone(), length));
+
+        let nonzero = Message::Hello {
+            version: PROTOCOL_VERSION,
+            features: 0,
+            extension: 1,
+        };
+        assert_eq!(
+            encode(&nonzero, &mut frame).unwrap_err(),
+            ProtocolError::InvalidPayload
+        );
+        frame[9..13].copy_from_slice(&1u32.to_be_bytes());
+        assert_eq!(
+            decode(&frame[..length]).unwrap_err(),
+            ProtocolError::InvalidPayload
+        );
+
+        assert!(ServerState::Start.accept(&nonzero).is_err());
+        assert!(ClientState::Start.sent(&nonzero).is_err());
+        let mut server = ServerState::Start;
+        server.accept(&hello).unwrap();
+        assert_eq!(server, ServerState::AwaitAuth);
+        let mut client = ClientState::Start;
+        client.sent(&hello).unwrap();
+        assert_eq!(client, ClientState::AwaitChallenge);
     }
 
     #[test]
@@ -1421,6 +1483,7 @@ mod tests {
             Message::Hello {
                 version: PROTOCOL_VERSION,
                 features: 0,
+                extension: RESERVED_EXTENSION,
             },
             Message::Challenge {
                 server_nonce: [7; 32],
@@ -1575,6 +1638,7 @@ mod tests {
             .sent(&Message::Hello {
                 version: PROTOCOL_VERSION,
                 features: 0,
+                extension: RESERVED_EXTENSION,
             })
             .unwrap();
         state

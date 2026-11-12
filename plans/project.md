@@ -220,7 +220,7 @@ The sans-IO wire protocol for both roles. No sockets, no allocation on the hot p
 
 * ALPN `ssxpro/1`. Stream 0 is the control stream (high priority). Stream 4 is the PTY data stream; with compression `off` it is raw bytes, otherwise it carries bounded compressed frames selected by the server. QUIC flow control does the work in both cases.
 * Control frames: varint type, length-prefixed, bounded fields, **max 4 KiB**.
-  * `Hello{version, features}`
+  * `Hello{version, features, extension}`
   * `AuthChallenge{server_nonce, compression}`
   * `AuthRequest{user, pubkey, client_nonce, sig}`
   * `AuthOk` / `AuthFail{reason_class}`
