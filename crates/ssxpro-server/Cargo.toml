@@ -14,6 +14,7 @@ ssxpro-proto = { path = "../ssxpro-proto" }
 ssxpro-crypto = { path = "../ssxpro-crypto" }
 ssxpro-io = { path = "../ssxpro-io" }
 ssxpro-config = { path = "../ssxpro-config" }
+ssxpro-compression = { path = "../ssxpro-compression" }
 clap.workspace = true
 libc.workspace = true
 quiche = { version = "=0.30.0", default-features = true }

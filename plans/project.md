@@ -1,6 +1,6 @@
 # ssxpro — P-RAN-11
 
-Status: In progress (2026-11-04) — M0–M3 complete; M5 functional end-to-end; M4, M6, M7 partial; M8/M9 foundations only; M10/M11 not started.
+Status: In progress (2026-11-12) — M0–M3 complete; M5 functional end-to-end including server-enforced PTY compression; M4, M6, M7 partial; M8/M9 foundations only; M10 backlog; M11 docs partial.
 
 ## Overview
 
@@ -13,16 +13,21 @@ Status: In progress (2026-11-04) — M0–M3 complete; M5 functional end-to-end;
 * Config: YAML, with `deny_unknown_fields` and fail-closed validation
 * Scope: public-key auth, one PTY login shell per connection, resize, signals and exit status. No SFTP, exec, forwarding or password auth.
 
-## Progress snapshot (2026-11-04)
+## Progress snapshot (2026-11-12)
 
-**Working end to end.** `ssx` and `ssxd` complete a QUIC handshake (ALPN `ssxpro/1`) with Retry, pin the Ed25519 host SPKI, authenticate with a signed nonce, open a broker-created PTY login shell, carry interactive input/output over stream 4, and report the remote exit status. Verified on the local dev host with `tests/ssx_e2e.py`:
+**Working end to end.** `ssx` and `ssxd` complete a QUIC handshake (ALPN `ssxpro/1`) with Retry, pin the Ed25519 host SPKI, authenticate with a signed nonce, open a broker-created PTY login shell, carry interactive input/output over stream 4, and report the remote exit status. The workspace is at version `0.1.1`. Verified on the local dev host with `tests/ssx_e2e.py`:
 
 * A. shell round-trip: login, command output, exit `0`
 * B. remote exit status: `exit 7` → client exit `7`
 * C. authentication rejection (unauthorized key): exit `255`
 * D. host-key mismatch (wrong pinned SPKI): exit `255`, loud warning, auth never attempted
+* E. idle keepalive: the session survives a quiet period longer than the idle timeout
+* F. compression negotiation: the server-selected mode reaches the client, or `off` leaves stream 4 unframed
+* G. bulk compression data: multi-frame server output and client input round-trip through every configured mode
 
-**Verified commands:** `cargo build --workspace --locked`, `cargo test --workspace --locked` (32 tests), `cargo clippy --workspace --all-targets --locked` — clean; `python3 tests/ssx_e2e.py` — 4/4.
+**Server-enforced PTY compression (v0.1.1).** `ssxd.yaml` now has `compression: off|fast|standard|high`: `off` is raw stream-4 data, `fast` is LZ4, `standard` is Snappy, and `high` is Zstd level 19. The client advertises every supported algorithm in `Hello` feature bits; the server selects its configured mode in `AuthChallenge` and fails closed if the client does not advertise it. Compressed data uses bounded frames (`format`, uncompressed length, payload length) with stored-block fallback; control frames stay uncompressed. `tests/compression_e2e.sh` runs the full e2e suite against all four modes. The wire protocol is version 1 with ALPN `ssxpro/1`; compression is part of the initial release, so there is no legacy wire format to preserve.
+
+**Verified commands:** `cargo build --workspace --locked`, `cargo test --workspace --locked` (61 passed, 2 ignored), `cargo clippy --workspace --all-targets`, `cargo fmt --all -- --check`, `scripts/licenses.sh --check` — clean; `tests/compression_e2e.sh` — 7/7 scenarios in each of `off`, `fast`, `standard` and `high`.
 
 **Bugs fixed during the M5 bring-up:**
 
@@ -48,11 +53,11 @@ Status: In progress (2026-11-04) — M0–M3 complete; M5 functional end-to-end;
 
 ## Crates
 
-`ssxpro-proto` (sans-IO), `ssxpro-crypto`, `ssxpro-io` (ring runtime), `ssxpro-server`, `ssxpro-client`.
+`ssxpro-proto` (sans-IO), `ssxpro-compression` (bounded PTY block codecs), `ssxpro-crypto`, `ssxpro-io` (ring runtime), `ssxpro-server`, `ssxpro-client`.
 
 ## Milestones (one issue each)
 
-M0 spec and scaffold — **Done**; M1 config — **Done**; M2 crypto and keys — **Done** (host-key `memfd_secret` deferred); M3 proto — **Done** (property/fuzz-CI items open); M4 ring runtime — **In progress**; M5 end-to-end — **In progress** (functional, verification gaps); M6 monitor and PTY — **In progress**; M7 client UX — **In progress**; M8 multi-worker and steering — **In progress** (foundations only); M9 hardening — **In progress** (partial layers); M10 performance — **Backlog**; M11 packaging and docs — **Backlog**.
+M0 spec and scaffold — **Done**; M1 config — **Done**; M2 crypto and keys — **Done** (host-key `memfd_secret` deferred); M3 proto — **Done** (property/fuzz-CI items open); M4 ring runtime — **In progress**; M5 end-to-end — **In progress** (functional including compression, verification gaps); M6 monitor and PTY — **In progress**; M7 client UX — **In progress**; M8 multi-worker and steering — **In progress** (foundations only); M9 hardening — **In progress** (partial layers); M10 performance — **Backlog**; M11 packaging and docs — **Backlog** (docs partial).
 
 **Assisted By:** Anthropic Claude Sonnet 5.5
 
@@ -85,7 +90,7 @@ Write the spec before the code, set up the workspace, and lock down the build an
 
 ## Progress
 
-* `SPEC.md`, the six-crate workspace, `ssxd`/`ssx` binaries, `deny.toml`, `rustfmt.toml`, config examples, `scripts/cargo-pinned.sh` and `scripts/check-kernel-version.sh` are in the tree.
+* `SPEC.md`, the seven-crate workspace (including `ssxpro-compression`), `ssxd`/`ssx` binaries, `deny.toml`, `rustfmt.toml`, config examples, `scripts/cargo-pinned.sh` and `scripts/check-kernel-version.sh` are in the tree.
 * Spike answers are recorded in `SPEC.md`: no TLS exporter on quiche's public connection API (nonce + SPKI binding for v1), feature-to-version audit, and the PTY multishot read deferred to an M6 probe.
 * BoringSSL/quiche pins and the update procedure are in `docs/dependencies.md` (quiche `0.30.0`, BoringSSL commit `44b3df6f03d85c901767250329c571db405122d5` via `boring-sys` `4.22.0`).
 * Kernel matrix runners are documented in `docs/ci-kernels.md`; the workflow file that used them is no longer in the tree.
@@ -113,7 +118,7 @@ Typed, validated YAML config for `ssxd` and `ssx`. Fail closed.
 
 ## Scope
 
-`ssxd` (`/etc/ssx/ssxd.yaml`): `listen`, `host_key`, `workers`, `io`, `quic`, `proto`, `auth`, `session`, `log`.
+`ssxd` (`/etc/ssx/ssxd.yaml`): `listen`, `host_key`, `compression`, `workers`, `io`, `quic`, `proto`, `auth`, `session`, `log`.
 
 ```yaml
 io:
@@ -143,6 +148,7 @@ io:
 
 * Configuration paths: `ssxd` reads `/etc/ssx/ssxd.yaml` and `ssx` reads `~/.ssx/config.yaml`; per-user keys, `authorized_keys`, and `known_hosts` live under `~/.ssx` (renamed from `/etc/ssxpro` and `~/.ssxpro`).
 * Both config types parse strictly with defaults; unknown keys, wrong types and range errors report the YAML key and source line (unit tests cover each case).
+* The server `compression` enum (`off`, `fast`, `standard`, `high`) defaults to `off`; invalid values are rejected with line-accurate errors and all documented modes are covered by tests.
 * `ssxd --check-config` runs the kernel probe and reports PASS/FAIL/SKIP per feature; exit codes are documented in `docs/configuration.md` and covered by tests (`masked_requested_feature_is_a_hard_failure`, CLI usage/config exit codes).
 * Config, host-key, and authorized_keys reads use `openat2` with `RESOLVE_NO_SYMLINKS`; `--yes-I-know-permission-risks-go-ahead-please` exists for unprivileged dev runs only and skips owner/mode checks for all of them.
 * `config/ssxd.example.yaml` and `config/ssx.example.yaml` are complete examples; `features:` gates the optional server features.
@@ -208,10 +214,10 @@ The sans-IO wire protocol for both roles. No sockets, no allocation on the hot p
 
 ## Scope
 
-* ALPN `ssxpro/1`. Stream 0 is the control stream (high priority). Stream 4 is the raw PTY data stream with no framing and no extra window; QUIC flow control does the work.
+* ALPN `ssxpro/1`. Stream 0 is the control stream (high priority). Stream 4 is the PTY data stream; with compression `off` it is raw bytes, otherwise it carries bounded compressed frames selected by the server. QUIC flow control does the work in both cases.
 * Control frames: varint type, length-prefixed, bounded fields, **max 4 KiB**.
-  * `Hello{version, features}`
-  * `AuthChallenge{server_nonce}`
+  * `Hello{version, features, extension}`
+  * `AuthChallenge{server_nonce, compression}`
   * `AuthRequest{user, pubkey, client_nonce, sig}`
   * `AuthOk` / `AuthFail{reason_class}`
   * `OpenShell{term, rows, cols}`
@@ -229,12 +235,14 @@ The sans-IO wire protocol for both roles. No sockets, no allocation on the hot p
 * Round-trip, fragmented-frame decode, noncanonical/oversize rejection and strict state-machine tests pass; `auth_binding_matches_spec_field_order` pins the signed byte order.
 * Fuzz targets `proto_codec.rs` and `proto_state.rs` exist, plus `monitor_ipc.rs` for the IPC decoders.
 * Stream 4 is opened with a single 0x00 marker byte (decided during M5 bring-up). The marker is transport-level, so the control-frame codec is unchanged; `SPEC.md` documents it in the wire format and both state machines.
+* Compression negotiation uses `Hello` feature bits 0–2 (LZ4, Snappy, Zstd); `AuthChallenge` carries the server-selected algorithm and unknown feature bits or unsupported selections fail closed. `SPEC.md` documents the algorithm IDs and frame layout.
 
 ## Acceptance criteria
 
 - [ ] Encode/decode round-trip and property tests — round-trip covered by unit tests; no property-test harness yet
 - [ ] Fuzz targets for the codec and both state machines, run with sanitizers in CI — targets exist; CI execution missing
 - [x] Negative tests: replayed, reordered, truncated and oversize frames
+- [x] Compression feature-bit negotiation and bounded frame codec covered by tests
 - [x] The crate has no I/O or async dependencies
 
 **Assisted By:** Anthropic Claude Sonnet 5.5
@@ -302,7 +310,7 @@ Priority: No priority
 
 ## RAN-193 — M5: End-to-end on io_uring: handshake, SPKI pinning, auth, echo
 
-Status: In progress (functional end-to-end path done; verification items open)
+Status: In progress (functional end-to-end path and compression matrix done; verification items open)
 Priority: No priority
 
 ## Goal
@@ -323,6 +331,7 @@ The first working client and server on the ring runtime: handshake, pinning, aut
 * The full path works locally and is covered by `tests/ssx_e2e.py` (PTY-driven): handshake with Retry, SPKI pin, challenge/response auth verified by the monitor, PTY login shell, stream-4 input/output, resize/signal plumbing, and remote exit status.
 * `ssxd` serves multiple sessions via a forked monitor (signing + auth) and a forked session broker (PTY), and drains cleanly on SIGTERM.
 * Idle sessions survive AFK: the client idle timeout was wrongly bound to `handshake_timeout_secs` (15 s). It is now `idle_timeout_secs` (default 600 s), and QUIC PING keepalives (`server_alive_interval_secs`/`server_alive_count_max` client-side, `quic.keep_alive_interval_secs` server-side) keep quiet sessions alive. Covered by `tests/ssx_e2e.py` scenario `E-idle-keepalive`.
+* Server-enforced PTY compression works end to end: the server selects `off`, LZ4, Snappy or Zstd level 19 from its config, negotiates it through `Hello`/`AuthChallenge`, and both directions use bounded stream-4 frames when enabled. `tests/compression_e2e.sh` runs scenarios F (negotiation) and G (multi-frame bulk data) plus the original suite under all four modes; 7/7 pass per mode.
 * Fixed to reach this state: Ed25519 client sigalgs, control-phase flush/receive, stream-4 open, short-header dispatch, register-op restrictions, monitor `statx` seccomp allowance.
 * Beyond the milestone scope, sessions are real PTY login shells (M6 work), not just an echo.
 * The data stream opens with a client 0x00 marker, so the initial prompt arrives without a keystroke; scenario A waits for the shell banner with no input.
@@ -331,6 +340,7 @@ The first working client and server on the ring runtime: handshake, pinning, aut
 ## Acceptance criteria
 
 - [x] Client connects, pins, authenticates and echoes bytes both ways — verified as a full PTY round-trip by `tests/ssx_e2e.py` scenarios A/B
+- [x] Server-selected compression modes are negotiated and exercised end to end — all four modes pass the compression matrix
 - [ ] Wrong fingerprint, wrong key and replayed auth are all rejected — wrong fingerprint (D) and wrong key (C) verified; replay rejection enforced by one-time nonce, untested
 - [ ] An idle connection that never opens its streams is closed after the grace timer — implemented, untested
 - [ ] No `epoll_*` syscalls in an `strace` of either binary — no epoll in the code; not measured
@@ -588,8 +598,8 @@ Ship it: reproducible builds, service integration and documentation for `ssxd` a
 
 ## Progress
 
-* Already present: `config/ssxd.example.yaml`, `config/ssx.example.yaml`, `docs/configuration.md`, `docs/dependencies.md`, `docs/ci-kernels.md`, and `tests/ssx_e2e.py` (the local end-to-end driver, which can serve as the basis for the quickstart walkthrough).
-* Static release builds for `x86_64-unknown-linux-musl` work: `cargo build --release --target x86_64-unknown-linux-musl` produces fully static (non-PIE) `ssxd`/`ssx` via `.cargo/config.toml` and `scripts/musl-toolchain.cmake`; requires an `x86_64-linux-musl-gcc` cross toolchain on `PATH`. The glibc host build is unchanged, and the static binaries pass `tests/ssx_e2e.py` 5/5.
+* Already present: `config/ssxd.example.yaml`, `config/ssx.example.yaml`, `docs/configuration.md`, `docs/dependencies.md`, `docs/ci-kernels.md`, `tests/ssx_e2e.py` (the local end-to-end driver, which can serve as the basis for the quickstart walkthrough), and `tests/compression_e2e.sh` (the four-mode compression matrix). Compression configuration and wire framing are documented in `docs/configuration.md` and `SPEC.md`.
+* Static release builds for `x86_64-unknown-linux-musl` work: `cargo build --release --target x86_64-unknown-linux-musl` produces fully static (non-PIE) `ssxd`/`ssx` via `.cargo/config.toml` and `scripts/musl-toolchain.cmake`; requires an `x86_64-linux-musl-gcc` cross toolchain on `PATH`. The glibc host build is unchanged. The static binaries previously passed the 5-scenario e2e suite; rerunning the new 7-scenario suite and compression matrix against the static build is still pending.
 * Not started: reproducible-build notes and checksums, systemd unit, man pages, README, operations guide and the release checklist. `sd_notify` support itself is already implemented in `ssxd`.
 
 ## Acceptance criteria

@@ -107,6 +107,9 @@ fn default_listen() -> String {
 fn default_host_key() -> PathBuf {
     PathBuf::from("/etc/ssx/host_ed25519")
 }
+fn default_compression() -> CompressionMode {
+    CompressionMode::Off
+}
 fn default_workers() -> usize {
     std::thread::available_parallelism()
         .map_or(1, usize::from)
@@ -154,11 +157,27 @@ fn default_login_grace() -> u32 {
 fn default_max_sessions() -> u32 {
     1024
 }
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CompressionMode {
+    #[default]
+    Off,
+    /// LZ4, optimized for low CPU utilization.
+    Fast,
+    /// Snappy.
+    Standard,
+    /// Zstd level 19.
+    High,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
     pub listen: String,
     pub host_key: PathBuf,
+    /// Server-enforced PTY stream compression: off, fast (LZ4),
+    /// standard (Snappy), or high (Zstd level 19).
+    pub compression: CompressionMode,
     pub workers: usize,
     pub features: ConfigFeatures,
     pub io: IoConfig,
@@ -174,6 +193,7 @@ impl Default for ServerConfig {
         Self {
             listen: default_listen(),
             host_key: default_host_key(),
+            compression: default_compression(),
             workers: default_workers(),
             io: IoConfig::default(),
             quic: QuicConfig::default(),
@@ -668,6 +688,28 @@ mod tests {
         assert!(server.io.gro);
         let client = parse_client_yaml("").expect("empty client config uses defaults");
         assert_eq!(client.port, 22);
+    }
+
+    #[test]
+    fn compression_defaults_to_off_and_accepts_all_modes() {
+        let server = parse_server_yaml("").expect("empty server config uses defaults");
+        assert_eq!(server.compression, super::CompressionMode::Off);
+
+        for (name, expected) in [
+            ("off", super::CompressionMode::Off),
+            ("fast", super::CompressionMode::Fast),
+            ("standard", super::CompressionMode::Standard),
+            ("high", super::CompressionMode::High),
+        ] {
+            let server = parse_server_yaml(&format!("compression: {name}\n"))
+                .expect("documented compression mode is accepted");
+            assert_eq!(server.compression, expected);
+        }
+        for invalid in ["lz4", "snappy", "zstd", "FAST", "fastest"] {
+            let error = parse_server_yaml(&format!("compression: {invalid}\n"))
+                .expect_err("unknown compression mode is rejected");
+            assert_eq!(error.line, Some(1));
+        }
     }
 
     #[test]

@@ -89,7 +89,7 @@ list_generated() {
   return 0
 }
 
-# License body for one crate version on stdout: the upstream LICENSE/COPYING/NOTICE
+# License body for one crate version on stdout: the upstream LICENSE/COPYING/NOTICE/AUTHORS
 # files joined by "=====" banners. Returns 1 when nothing at all could be found.
 crate_body() {
   local name="$1" version="$2" src="$SRC_ROOT/$1-$2"
@@ -101,10 +101,10 @@ crate_body() {
     return 1
   fi
 
-  # A crate may ship LICENSE, LICENSE-MIT, LICENSE-APACHE, COPYING, ...
+  # A crate may ship LICENSE, LICENSE-MIT, LICENSE-APACHE, COPYING, AUTHORS, ...
   mapfile -d '' files < <(
     find "$src" -maxdepth 1 -type f \
-      \( -iname 'license*' -o -iname 'copying*' -o -iname 'notice*' \) -print0 | sort -z
+      \( -iname 'license*' -o -iname 'copying*' -o -iname 'notice*' -o -iname 'authors' \) -print0 | sort -z
   )
 
   if [ "${#files[@]}" -eq 0 ]; then

@@ -1,5 +1,11 @@
 listen: "0.0.0.0:2222"
 host_key: "/etc/ssx/host_ed25519"
+# PTY stream compression, enforced by the server:
+#   off      - no compression
+#   fast     - LZ4, optimized for low CPU utilization
+#   standard - Snappy
+#   high     - Zstd level 19
+compression: off
 workers: 1
 io:
   ring_entries: 4096

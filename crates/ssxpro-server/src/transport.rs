@@ -1,10 +1,12 @@
 use boring::hash::hmac_sha256;
+use ssxpro_compression::{Decoder as CompressionDecoder, Encoder as CompressionEncoder};
 use ssxpro_crypto::{constant_time_eq, getrandom, sha256};
 use ssxpro_io::{RuntimeRing, UdpEndpoint};
 use ssxpro_proto::{
     decode_broker_response, encode, encode_broker_close_request, encode_broker_open_request,
-    encode_broker_signal_request, BrokerResponse, BrokerStatus, FrameDecoder, Message, ServerState,
-    MAX_BROKER_FRAME, MAX_WIRE_FRAME,
+    encode_broker_signal_request, BrokerResponse, BrokerStatus, Compression, FrameDecoder, Message,
+    ServerState, MAX_BROKER_FRAME, MAX_WIRE_FRAME, PROTOCOL_VERSION, RESERVED_EXTENSION,
+    SUPPORTED_FEATURES,
 };
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Shutdown, SocketAddr};
@@ -46,6 +48,9 @@ struct PeerSession {
     peer_ip: IpAddr,
     state: ServerState,
     decoder: FrameDecoder,
+    compression: Compression,
+    compression_encoder: Option<CompressionEncoder>,
+    compression_decoder: Option<CompressionDecoder>,
     server_nonce: Option<[u8; 32]>,
     authenticated: bool,
     send_failed: bool,
@@ -59,6 +64,7 @@ struct PeerSession {
     pty_pending: VecDeque<Vec<u8>>,
     pty_pending_bytes: usize,
     pty_input: VecDeque<u8>,
+    input_fin: bool,
     pty_fin: bool,
     exit_observed_at: Option<Instant>,
     max_rows: u16,
@@ -540,6 +546,16 @@ fn serve_worker(
             }
         })?;
     let spki_hash = sha256(&spki_der)?;
+    let configured_compression = match config.compression {
+        ssxpro_config::CompressionMode::Off => Compression::Off,
+        ssxpro_config::CompressionMode::Fast => Compression::Fast,
+        ssxpro_config::CompressionMode::Standard => Compression::Standard,
+        ssxpro_config::CompressionMode::High => Compression::High,
+    };
+    debug1!(
+        verbose,
+        "worker {worker_id} compression mode: {configured_compression:?}"
+    );
     let local = endpoint.local_addr()?;
     let mut sessions: HashMap<Vec<u8>, PeerSession> = HashMap::new();
     let mut connection_ids: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
@@ -690,14 +706,13 @@ fn serve_worker(
                             continue;
                         }
                     }
-                    if !config.quic.retry {
-                        if !initial_rate_limiter
+                    if !config.quic.retry
+                        && !initial_rate_limiter
                             .lock()
                             .map_err(|_| "initial rate limiter lock poisoned")?
                             .allow(peer.ip())
-                        {
-                            continue;
-                        }
+                    {
+                        continue;
                     }
                     let original_dcid = if config.quic.retry {
                         validate_retry_token(
@@ -749,6 +764,9 @@ fn serve_worker(
                             state: ServerState::Start,
                             peer_ip: peer.ip(),
                             decoder: FrameDecoder::new(),
+                            compression: Compression::Off,
+                            compression_encoder: None,
+                            compression_decoder: None,
                             server_nonce: None,
                             authenticated: false,
                             pending_auth: None,
@@ -762,6 +780,7 @@ fn serve_worker(
                             pty_pending: VecDeque::new(),
                             pty_pending_bytes: 0,
                             pty_input: VecDeque::new(),
+                            input_fin: false,
                             pty_fin: false,
                             exit_observed_at: None,
                             max_rows: config.session.max_rows,
@@ -831,6 +850,7 @@ fn serve_worker(
                             &spki_hash,
                             active_sessions,
                             session_limit,
+                            configured_compression,
                             &auth_sender,
                             &auth_failure_limiter,
                             &connection_key,
@@ -1077,6 +1097,7 @@ fn process_control(
     spki_hash: &[u8; 32],
     active_sessions: usize,
     session_limit: usize,
+    configured_compression: Compression,
     auth_sender: &mpsc::SyncSender<AuthJob>,
     auth_failures: &Mutex<AuthFailureLimiter>,
     connection_key: &[u8],
@@ -1096,11 +1117,24 @@ fn process_control(
         while let Some(message) = peer.decoder.decode_next()? {
             peer.state.accept(&message)?;
             match message {
-                Message::Hello { version: 1, .. } => {
+                Message::Hello {
+                    version: PROTOCOL_VERSION,
+                    features,
+                    extension: RESERVED_EXTENSION,
+                } => {
+                    let selected = negotiate_compression(configured_compression, features)?;
+                    peer.compression = selected;
+                    if selected == Compression::Off {
+                        peer.compression_encoder = None;
+                        peer.compression_decoder = None;
+                    } else {
+                        peer.compression_encoder = Some(CompressionEncoder::new(selected)?);
+                        peer.compression_decoder = Some(CompressionDecoder::new(selected)?);
+                    }
                     peer.hello_at = Some(std::time::Instant::now());
                     debug1!(
                         verbose,
-                        "received Hello from {} (session {})",
+                        "received Hello from {} (session {}, compression={selected:?})",
                         peer.peer_ip,
                         short_hex(connection_key)
                     );
@@ -1108,7 +1142,9 @@ fn process_control(
                     getrandom(&mut nonce)?;
                     peer.server_nonce = Some(nonce);
                     let response = Message::Challenge {
+                        extension: RESERVED_EXTENSION,
                         server_nonce: nonce,
+                        compression: selected,
                     };
                     send_control(&mut peer.conn, &response)?;
                     peer.state.sent(&response)?;
@@ -1125,6 +1161,7 @@ fn process_control(
                     public_key,
                     client_nonce,
                     signature,
+                    ..
                 } => {
                     let name = std::str::from_utf8(&user[..usize::from(user_len)])?;
                     debug1!(
@@ -1163,6 +1200,7 @@ fn process_control(
                     term_len,
                     rows,
                     cols,
+                    ..
                 } if peer.authenticated => {
                     let name = peer
                         .identity
@@ -1207,7 +1245,7 @@ fn process_control(
                     peer.session_request_id = Some(request_id);
                     pending_sessions.insert(request_id, connection_key.to_vec());
                 }
-                Message::Resize { rows, cols } if peer.authenticated => {
+                Message::Resize { rows, cols, .. } if peer.authenticated => {
                     if rows > peer.max_rows || cols > peer.max_columns {
                         return Err("requested terminal dimensions exceed server policy".into());
                     }
@@ -1215,7 +1253,7 @@ fn process_control(
                         session.resize(rows, cols)?;
                     }
                 }
-                Message::Signal { signal } if peer.authenticated => {
+                Message::Signal { signal, .. } if peer.authenticated => {
                     if let Some(session) = &peer.pty {
                         let mut frame = [0u8; MAX_BROKER_FRAME];
                         let length =
@@ -1237,6 +1275,20 @@ fn process_control(
         }
     }
     Ok(())
+}
+
+fn negotiate_compression(
+    configured: Compression,
+    client_features: u32,
+) -> Result<Compression, Box<dyn std::error::Error>> {
+    if client_features & !SUPPORTED_FEATURES != 0 {
+        return Err("Hello advertises unknown feature bits".into());
+    }
+    if configured.is_supported_by(client_features) {
+        Ok(configured)
+    } else {
+        Err(format!("client does not support server-required compression {configured:?}").into())
+    }
 }
 
 fn allocate_request_id(next_request_id: &mut u32, pending_sessions: &HashMap<u32, Vec<u8>>) -> u32 {
@@ -1388,6 +1440,7 @@ fn close_peer_session(
     peer.pty_pending.clear();
     peer.pty_pending_bytes = 0;
     peer.pty_fin = false;
+    peer.input_fin = false;
     peer.exit_observed_at = None;
     if let Some(mut token) = peer.session_token.take() {
         token.zeroize();
@@ -1402,6 +1455,13 @@ fn process_data(
         return Ok(());
     }
     drain_pty_input(peer)?;
+    if !decode_pty_input(peer, &[])? {
+        return Ok(());
+    }
+    if peer.input_fin {
+        finish_pty_input(peer)?;
+        return Ok(());
+    }
     let mut input = [0u8; 16 * 1024];
     for stream in peer.conn.readable().collect::<Vec<_>>() {
         if stream != 4 {
@@ -1436,18 +1496,44 @@ fn process_data(
                 peer.stream4_opened = true;
                 data = rest;
             }
-            if !data.is_empty() {
-                peer.pty_input.extend(data);
+            peer.input_fin = fin;
+            if !decode_pty_input(peer, data)? {
+                break;
             }
             if fin {
-                peer.pty_input.push_back(0x04);
-                drain_pty_input(peer)?;
+                finish_pty_input(peer)?;
                 break;
             }
             drain_pty_input(peer)?;
         }
     }
     Ok(())
+}
+
+// Retry retained frames even when QUIC no longer reports stream 4 readable.
+fn decode_pty_input(
+    peer: &mut PeerSession,
+    data: &[u8],
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let capacity = (256 * 1024usize).saturating_sub(peer.pty_input.len() + 1);
+    if let Some(decoder) = peer.compression_decoder.as_mut() {
+        let mut decoded = Vec::new();
+        let blocked = decoder.push_bounded(data, &mut decoded, capacity)?;
+        peer.pty_input.extend(decoded);
+        Ok(!blocked)
+    } else {
+        peer.pty_input.extend(data);
+        Ok(true)
+    }
+}
+
+fn finish_pty_input(peer: &mut PeerSession) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(decoder) = peer.compression_decoder.as_ref() {
+        decoder.finish()?;
+    }
+    peer.input_fin = false;
+    peer.pty_input.push_back(0x04);
+    drain_pty_input(peer)
 }
 
 fn pty_reader(master_fd: RawFd) -> Result<PtyReader, Box<dyn std::error::Error>> {
@@ -1545,6 +1631,11 @@ fn pump_pty(peer: &mut PeerSession) -> Result<(), Box<dyn std::error::Error>> {
             }
             match receiver.try_recv() {
                 Ok(Ok(data)) => {
+                    let data = if let Some(encoder) = peer.compression_encoder.as_mut() {
+                        encoder.encode(&data)?
+                    } else {
+                        data
+                    };
                     peer.pty_pending_bytes += data.len();
                     peer.pty_pending.push_back(data);
                 }
@@ -1582,7 +1673,11 @@ fn pump_pty(peer: &mut PeerSession) -> Result<(), Box<dyn std::error::Error>> {
             && peer.pty_pending.is_empty()
             && !peer.conn.is_closed()
         {
-            let exit = Message::Exit { kind, value };
+            let exit = Message::Exit {
+                extension: RESERVED_EXTENSION,
+                kind,
+                value,
+            };
             send_control(&mut peer.conn, &exit)?;
             peer.state.sent(&exit)?;
             peer.conn.stream_send(4, &[], true)?;
@@ -1725,6 +1820,72 @@ fn flush_quic(
     Ok(())
 }
 
+fn peer_send_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(
+            libc::ENETUNREACH
+                | libc::EHOSTUNREACH
+                | libc::ECONNREFUSED
+                | libc::EHOSTDOWN
+                | libc::ENETDOWN
+                | libc::EMSGSIZE
+        )
+    )
+}
+
+struct AuthJob {
+    user: String,
+    public_key: [u8; 32],
+    server_nonce: [u8; 32],
+    client_nonce: [u8; 32],
+    spki_hash: [u8; 32],
+    signature: [u8; 64],
+    response: mpsc::SyncSender<std::io::Result<Option<crate::tls::AuthorizedLogin>>>,
+}
+
+fn complete_authorization(
+    peer: &mut PeerSession,
+    failures: &Arc<Mutex<AuthFailureLimiter>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(receiver) = &peer.pending_auth else {
+        return Ok(());
+    };
+    let result = match receiver.try_recv() {
+        Ok(result) => result,
+        Err(TryRecvError::Empty) => return Ok(()),
+        Err(TryRecvError::Disconnected) => return Err("authorization service disconnected".into()),
+    };
+    peer.pending_auth = None;
+    if peer.conn.is_closed()
+        || peer.conn.is_draining()
+        || peer.conn.local_error().is_some()
+        || peer.state != ServerState::AuthPending
+    {
+        return Ok(());
+    }
+    let Some(login) = result? else {
+        failures
+            .lock()
+            .map_err(|_| "auth limiter lock poisoned")?
+            .record_failure(peer.peer_ip);
+        return Err("login authorization rejected".into());
+    };
+    peer.authenticated = true;
+    peer.identity = Some(login.identity);
+    peer.session_token = Some(login.token);
+    send_control(
+        &mut peer.conn,
+        &Message::AuthOk {
+            extension: RESERVED_EXTENSION,
+        },
+    )?;
+    peer.state.sent(&Message::AuthOk {
+        extension: RESERVED_EXTENSION,
+    })?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1739,6 +1900,26 @@ mod tests {
 
     use super::{mint_retry_token, validate_retry_token};
     use std::net::SocketAddr;
+
+    #[test]
+    fn compression_negotiation_enforces_server_configuration() {
+        use super::{negotiate_compression, Compression, SUPPORTED_FEATURES};
+
+        assert_eq!(
+            negotiate_compression(Compression::Off, 0).unwrap(),
+            Compression::Off
+        );
+        assert_eq!(
+            negotiate_compression(Compression::Fast, SUPPORTED_FEATURES).unwrap(),
+            Compression::Fast
+        );
+        assert_eq!(
+            negotiate_compression(Compression::High, SUPPORTED_FEATURES).unwrap(),
+            Compression::High
+        );
+        assert!(negotiate_compression(Compression::High, 0).is_err());
+        assert!(negotiate_compression(Compression::Fast, SUPPORTED_FEATURES | (1 << 31)).is_err());
+    }
 
     #[test]
     fn pty_backpressure_retains_every_byte() {
@@ -1824,63 +2005,4 @@ mod tests {
         changed[12] = 9;
         assert!(validate_retry_token(&seed, &peer, &changed).is_none());
     }
-}
-
-fn peer_send_error(error: &std::io::Error) -> bool {
-    matches!(
-        error.raw_os_error(),
-        Some(
-            libc::ENETUNREACH
-                | libc::EHOSTUNREACH
-                | libc::ECONNREFUSED
-                | libc::EHOSTDOWN
-                | libc::ENETDOWN
-                | libc::EMSGSIZE
-        )
-    )
-}
-
-struct AuthJob {
-    user: String,
-    public_key: [u8; 32],
-    server_nonce: [u8; 32],
-    client_nonce: [u8; 32],
-    spki_hash: [u8; 32],
-    signature: [u8; 64],
-    response: mpsc::SyncSender<std::io::Result<Option<crate::tls::AuthorizedLogin>>>,
-}
-
-fn complete_authorization(
-    peer: &mut PeerSession,
-    failures: &Arc<Mutex<AuthFailureLimiter>>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(receiver) = &peer.pending_auth else {
-        return Ok(());
-    };
-    let result = match receiver.try_recv() {
-        Ok(result) => result,
-        Err(TryRecvError::Empty) => return Ok(()),
-        Err(TryRecvError::Disconnected) => return Err("authorization service disconnected".into()),
-    };
-    peer.pending_auth = None;
-    if peer.conn.is_closed()
-        || peer.conn.is_draining()
-        || peer.conn.local_error().is_some()
-        || peer.state != ServerState::AuthPending
-    {
-        return Ok(());
-    }
-    let Some(login) = result? else {
-        failures
-            .lock()
-            .map_err(|_| "auth limiter lock poisoned")?
-            .record_failure(peer.peer_ip);
-        return Err("login authorization rejected".into());
-    };
-    peer.authenticated = true;
-    peer.identity = Some(login.identity);
-    peer.session_token = Some(login.token);
-    send_control(&mut peer.conn, &Message::AuthOk)?;
-    peer.state.sent(&Message::AuthOk)?;
-    Ok(())
 }

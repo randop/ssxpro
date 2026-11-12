@@ -1,9 +1,13 @@
 # ssxpro protocol and security specification
 
 Status: M0 baseline (2026-11-04)  
-Protocol version: 1  
-ALPN: `ssxpro/1`  
+Protocol version: 1<br>
+ALPN: `ssxpro/1`<br>
 Transport: QUIC over UDP, normally port 22. This is a new protocol and is not SSH.
+
+## Protocol versioning
+
+Version 1 requires ALPN `ssxpro/1` and Hello version 1. Its AuthChallenge is 37 bytes: the 32-byte nonce, the compression selector, and the extension word, including when compression is off. Every control frame except `Close` ends with a reserved `u32` extension word: version 1 senders set it to zero, and receivers reject any nonzero value until a future version defines it. This is the initial release, so there are no legacy peers or compatibility modes; clients and servers must use this version. Mixed versions fail ALPN negotiation. The authentication proof construction remains unchanged.
 
 ## Goals and non-goals
 
@@ -13,32 +17,28 @@ ssxpro provides public-key authenticated interactive login to one PTY-backed log
 
 QUIC provides confidentiality, integrity, peer transport authentication, stream ordering, and flow control. TLS 1.3 is carried inside QUIC by quiche/BoringSSL; there is no second encryption layer.
 
-The client negotiates ALPN `ssxpro/1`. Stream 0 is the bidirectional control stream. Stream 4 is a bidirectional byte stream for PTY data. The client opens stream 4 immediately after `OpenShell` with a single 0x00 open marker; the server discards exactly that first byte. All remaining stream-4 bytes are unframed PTY data and QUIC flow control supplies backpressure. A stream 4 whose first byte is not 0x00, or a FIN before the marker, is a protocol error. All other stream IDs are forbidden in v1. The control stream is opened first and has priority over PTY data.
+The client negotiates ALPN `ssxpro/1`. Stream 0 is the bidirectional control stream. Stream 4 is a bidirectional byte stream for PTY data. The client opens stream 4 immediately after `OpenShell` with a single 0x00 open marker; the server discards exactly that first byte. All remaining stream-4 bytes carry PTY data, either raw or in compression frames when the server selected a compression mode. QUIC flow control supplies backpressure. A stream 4 whose first byte is not 0x00, or a FIN before the marker, is a protocol error. All other stream IDs are forbidden in v1. The control stream is opened first and has priority over PTY data.
 
 Control frames are `type` followed by `length` followed by `payload`. `type` is a QUIC varint; `length` is an unsigned big-endian 16-bit byte count. The payload is at most 4096 bytes. Integers in payloads are unsigned big-endian unless stated otherwise. Strings are UTF-8, nonempty where required, and contain no NUL. Decoders reject trailing bytes, invalid UTF-8, noncanonical/overflowing integer encodings, unknown message types, and lengths above the bound. A frame is not acted on until its full declared payload has arrived.
 
-<!-- coderabbit-ai-generated:v1 -->
-
-<!-- coderabbit-ai-generated-section:v1:f27873c5831c54ba43fcfdd32b555f28208c18f69950dc9c0ba5902665da1380 -->
-
 | Type | Direction | Payload |
 |---|---|---|
-| 0x00 `Hello` | client→server | version u16 (=1), feature bits u32 (unknown bits rejected) |
-| 0x01 `AuthChallenge` | server→client | 32-byte unpredictable server nonce |
-| 0x02 `AuthRequest` | client→server | username (u16 length + UTF-8), Ed25519 public key (32), client nonce (32), signature (64) |
-| 0x03 `AuthOk` | server→client | empty |
-| 0x04 `AuthFail` | server→client | reason class u8; classes are `denied`=1 and `temporarily_unavailable`=2 |
-| 0x05 `OpenShell` | client→server | terminal name (u16 length + UTF-8, max 64), rows u16, columns u16 |
-| 0x06 `Resize` | client→server | rows u16, columns u16 |
-| 0x07 `Signal` | client→server | signal u8: HUP=1, INT=2, QUIT=3, TERM=4, KILL=5, TSTP=6, CONT=7, WINCH=8 |
-| 0x08 `Exit` | server→client | kind u8 (status=0 or signal=1), value u8 |
+| 0x00 `Hello` | client→server | version u16 (=1), feature bits u32 (unknown bits rejected), reserved extension u32 (=0; nonzero rejected); bits 0–2 advertise LZ4, Snappy and Zstd stream compression support |
+| 0x01 `AuthChallenge` | server→client | 32-byte unpredictable server nonce, selected compression u8 (0=off, 1=LZ4, 2=Snappy, 3=Zstd), reserved extension u32 (=0; nonzero rejected) |
+| 0x02 `AuthRequest` | client→server | username (u16 length + UTF-8), Ed25519 public key (32), client nonce (32), signature (64), reserved extension u32 (=0; nonzero rejected) |
+| 0x03 `AuthOk` | server→client | reserved extension u32 (=0; nonzero rejected) |
+| 0x04 `AuthFail` | server→client | reason class u8 (`denied`=1, `temporarily_unavailable`=2), reserved extension u32 (=0; nonzero rejected) |
+| 0x05 `OpenShell` | client→server | terminal name (u16 length + UTF-8, max 64), rows u16, columns u16, reserved extension u32 (=0; nonzero rejected) |
+| 0x06 `Resize` | client→server | rows u16, columns u16, reserved extension u32 (=0; nonzero rejected) |
+| 0x07 `Signal` | client→server | signal u8: HUP=1, INT=2, QUIT=3, TERM=4, KILL=5, TSTP=6, CONT=7, WINCH=8, reserved extension u32 (=0; nonzero rejected) |
+| 0x08 `Exit` | server→client | kind u8 (status=0 or signal=1), value u8, reserved extension u32 (=0; nonzero rejected) |
 | 0x09 `Close` | either | application code u16 |
 
 Dimensions must be in 1..=4096. Terminal names are limited to 64 bytes. Username is limited to 256 bytes. Control message-specific exact payload lengths are mandatory. `Exit` status is 0..=255; signal values are native Linux signal numbers in 1..=64 (including signals outside the `Signal` control allowlist), as reported by `waitid`. These differ from control-message codes. Close codes are 0 normal, 1 protocol error, 2 authentication failed, 3 resource limit, 4 internal error. The peer receives only the coarse `AuthFail` class; details are logged locally by the monitor.
 
-## Client state machine
+The server configuration is authoritative for stream compression. `off` leaves stream 4 as raw bytes. `fast` selects LZ4, `standard` selects Snappy, and `high` selects Zstd level 19. The client advertises every algorithm it supports in `Hello`; the server selects the configured algorithm in `AuthChallenge` and rejects a client that does not advertise it. There is no silent downgrade. When compression is enabled, both directions send frames after the 0x00 open marker: `format:u8` (0 stored, 1 compressed), uncompressed length `u32be`, payload length `u32be`, then the payload. Stored blocks are used when compression would expand a block. Uncompressed blocks are limited to 64 KiB and compressed payloads to 128 KiB, so decoding is bounded. A FIN must fall on a frame boundary.
 
-<!-- /coderabbit-ai-generated:v1 -->
+## Client state machine
 
 `Hello → Auth → Open → Running → Exit`:
 

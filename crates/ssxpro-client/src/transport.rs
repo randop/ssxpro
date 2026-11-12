@@ -2,6 +2,9 @@ use crate::terminal::{take_resize_pending, EscapeAction, EscapeDecoder, RawMode}
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use boring::x509::X509;
+use ssxpro_compression::{
+    Decoder as CompressionDecoder, Encoder as CompressionEncoder, MAX_BLOCK_SIZE,
+};
 use ssxpro_config::KnownHostsPolicy;
 use ssxpro_crypto::{
     append_user_file, auth_signing_bytes, fingerprint_spki, getrandom, parse_known_hosts,
@@ -9,7 +12,10 @@ use ssxpro_crypto::{
     HostKeyError,
 };
 use ssxpro_io::{RuntimeRing, UdpEndpoint};
-use ssxpro_proto::{encode, ClientState, ExitKind, FrameDecoder, Message, MAX_WIRE_FRAME};
+use ssxpro_proto::{
+    encode, ClientState, Compression, ExitKind, FrameDecoder, Message, MAX_WIRE_FRAME,
+    PROTOCOL_VERSION, RESERVED_EXTENSION, SUPPORTED_FEATURES,
+};
 use std::collections::VecDeque;
 use std::io::Write;
 use std::net::ToSocketAddrs;
@@ -194,6 +200,7 @@ pub fn connect_and_echo(
     let mut state = ClientState::Start;
     let mut decoder = FrameDecoder::new();
     let mut auth_ok = false;
+    let mut compression = Compression::Off;
 
     // Send the initial ClientHello before entering the receive loop.
     flush(&mut conn, &endpoint, &mut ring, &mut output, verbose)?;
@@ -283,13 +290,14 @@ pub fn connect_and_echo(
         }
         if pin_checked && !sent_hello {
             let hello = Message::Hello {
-                version: 1,
-                features: 0,
+                version: PROTOCOL_VERSION,
+                features: SUPPORTED_FEATURES,
+                extension: RESERVED_EXTENSION,
             };
             send_control(&mut conn, &hello)?;
             state.sent(&hello)?;
             sent_hello = true;
-            debug1!(verbose, "sent client hello (version=1)");
+            debug1!(verbose, "sent client hello (version={PROTOCOL_VERSION})");
         }
         flush(&mut conn, &endpoint, &mut ring, &mut output, verbose)?;
         match endpoint.recv_from(&mut ring, &mut packet) {
@@ -319,8 +327,22 @@ pub fn connect_and_echo(
             while let Some(message) = decoder.decode_next()? {
                 state.accept(&message)?;
                 match message {
-                    Message::Challenge { server_nonce } => {
-                        debug1!(verbose, "received authentication challenge from server");
+                    Message::Challenge {
+                        server_nonce,
+                        compression: selected,
+                        ..
+                    } => {
+                        if !selected.is_supported_by(SUPPORTED_FEATURES) {
+                            return Err(format!(
+                                "server selected unsupported compression {selected:?}"
+                            )
+                            .into());
+                        }
+                        compression = selected;
+                        debug1!(
+                            verbose,
+                            "received authentication challenge from server (compression={selected:?})"
+                        );
                         let client_nonce = {
                             let mut nonce = [0; 32];
                             getrandom(&mut nonce)?;
@@ -347,6 +369,7 @@ pub fn connect_and_echo(
                         let mut user_field = [0; 256];
                         user_field[..user_bytes.len()].copy_from_slice(user_bytes);
                         let request = Message::AuthRequest {
+                            extension: RESERVED_EXTENSION,
                             user: user_field,
                             user_len: user_bytes.len() as u16,
                             public_key: public.0,
@@ -357,7 +380,7 @@ pub fn connect_and_echo(
                         state.sent(&request)?;
                         debug1!(verbose, "sent authentication request for user={user}");
                     }
-                    Message::AuthOk => {
+                    Message::AuthOk { extension: _ } => {
                         auth_ok = true;
                         debug1!(verbose, "authentication succeeded");
                         let (rows, cols) = terminal_size();
@@ -368,6 +391,7 @@ pub fn connect_and_echo(
                         let length = term_bytes.len().min(64);
                         term[..length].copy_from_slice(&term_bytes[..length]);
                         let open = Message::OpenShell {
+                            extension: RESERVED_EXTENSION,
                             term,
                             term_len: length as u8,
                             rows,
@@ -377,7 +401,7 @@ pub fn connect_and_echo(
                         state.sent(&open)?;
                         debug1!(verbose, "shell opened (TERM={term_value}, {rows}x{cols})");
                     }
-                    Message::AuthFail { reason_class } => {
+                    Message::AuthFail { reason_class, .. } => {
                         return Err(format!(
                             "server rejected authentication (class {reason_class})"
                         )
@@ -396,6 +420,13 @@ pub fn connect_and_echo(
     if !auth_ok {
         return Err("connection or authentication timed out".into());
     }
+    let mut compression_encoder = None;
+    let mut compression_decoder = None;
+    if compression != Compression::Off {
+        compression_encoder = Some(CompressionEncoder::new(compression)?);
+        compression_decoder = Some(CompressionDecoder::new(compression)?);
+        debug1!(verbose, "stream compression enabled ({compression:?})");
+    }
 
     // The TTY guard lives across the entire network loop and restores attributes on return/unwind.
     if unsafe { libc::isatty(libc::STDIN_FILENO) } != 1 {
@@ -406,6 +437,7 @@ pub fn connect_and_echo(
     let (input_rx, _input_thread) = start_input_reader()?;
     let mut escapes = EscapeDecoder::default();
     let mut input_pending = VecDeque::new();
+    let mut input_encoded = VecDeque::new();
     let mut input_eof = false;
     let mut input_fin = false;
     let mut stream4_opened = false;
@@ -478,6 +510,7 @@ pub fn connect_and_echo(
             let current_size = terminal_size();
             if current_size != last_size {
                 let resize = Message::Resize {
+                    extension: RESERVED_EXTENSION,
                     rows: current_size.0,
                     cols: current_size.1,
                 };
@@ -499,21 +532,38 @@ pub fn connect_and_echo(
                 Err(error) => return Err(Box::new(error)),
             }
         }
-        if stream4_opened && !input_pending.is_empty() {
+        if stream4_opened && input_encoded.is_empty() && !input_pending.is_empty() {
+            // Frame raw terminal input first, then feed the encoded bytes to
+            // QUIC so a partially sent frame can resume on the next tick.
+            let contiguous = input_pending.make_contiguous();
+            let take = contiguous.len().min(MAX_BLOCK_SIZE);
+            if let Some(encoder) = compression_encoder.as_mut() {
+                input_encoded.extend(encoder.encode(&contiguous[..take])?);
+            } else {
+                input_encoded.extend(&contiguous[..take]);
+            }
+            input_pending.drain(..take);
+        }
+        if stream4_opened && !input_encoded.is_empty() {
             // stream_send() creates stream 4 if it does not exist yet and
             // returns Done when flow control gives it no room.
-            let contiguous = input_pending.make_contiguous();
+            let contiguous = input_encoded.make_contiguous();
             let length = contiguous.len().min(16 * 1024);
             match conn.stream_send(4, &contiguous[..length], false) {
                 Ok(written) => {
-                    input_pending.drain(..written);
+                    input_encoded.drain(..written);
                     debug3!(verbose, "sent {written} bytes to server stream 4");
                 }
                 Err(quiche::Error::Done) => {}
                 Err(error) => return Err(Box::new(error)),
             }
         }
-        if stream4_opened && input_eof && input_pending.is_empty() && !input_fin {
+        if stream4_opened
+            && input_eof
+            && input_pending.is_empty()
+            && input_encoded.is_empty()
+            && !input_fin
+        {
             conn.stream_send(4, &[], true)?;
             input_fin = true;
             debug3!(verbose, "sent EOF to server stream 4");
@@ -544,10 +594,32 @@ pub fn connect_and_echo(
         }
         while let Ok((length, fin)) = conn.stream_recv(4, &mut packet) {
             if length > 0 {
-                ring_write_all(&mut ring, libc::STDOUT_FILENO, &packet[..length])?;
+                if let Some(stream_decoder) = compression_decoder.as_mut() {
+                    let mut decoded = Vec::new();
+                    let mut input = &packet[..length];
+                    loop {
+                        let blocked =
+                            stream_decoder.push_bounded(input, &mut decoded, MAX_BLOCK_SIZE)?;
+
+                        ring_write_all(&mut ring, libc::STDOUT_FILENO, &decoded)?;
+                        if !blocked {
+                            break;
+                        }
+                        // Drain retained frames before receiving more stream data.
+                        decoded.clear();
+                        input = &[];
+                    }
+                } else {
+                    ring_write_all(&mut ring, libc::STDOUT_FILENO, &packet[..length])?;
+                }
                 debug3!(verbose, "received {length} bytes from server stream 4");
             }
-            data_finished |= fin;
+            if fin {
+                if let Some(stream_decoder) = compression_decoder.as_ref() {
+                    stream_decoder.finish()?;
+                }
+                data_finished = true;
+            }
         }
         let mut control = [0u8; MAX_WIRE_FRAME];
         while let Ok((length, _)) = conn.stream_recv(0, &mut control) {
@@ -557,7 +629,7 @@ pub fn connect_and_echo(
             while let Some(message) = decoder.decode_next()? {
                 state.accept(&message)?;
                 debug3!(verbose, "received control message: {message:?}");
-                if let Message::Exit { kind, value } = message {
+                if let Message::Exit { kind, value, .. } = message {
                     remote_status = if kind == ExitKind::Status {
                         value
                     } else {
