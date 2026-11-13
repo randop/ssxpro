@@ -321,7 +321,7 @@ The first working client and server on the ring runtime: handshake, pinning, aut
 
 * quiche on BoringSSL inside the ring loops of `ssxd` and `ssx` (sans-IO quiche, fed by `ssxpro-io`).
 * Self-signed cert generated from the Ed25519 host key. Identity is the **SPKI SHA-256 fingerprint**, so cert regeneration doesn't matter.
-* Client sets `verify_peer(false)` and compares the SPKI fingerprint against `known_hosts` **before sending anything sensitive**. First connect prompts `(Y/n)`, or `--approve-host` saves the key without prompting.
+* Historical v0.1.0 design: the client used `verify_peer(false)` with SPKI pinning and a yes/no trust prompt. Superseded by the TLS 1.3 security hardening: TLS 1.3-only contexts, mandatory SPKI checks before application data, default-deny host enrollment, and optional CA-chain plus SAN verification (see `docs/tls-security.md`).
 * Auth per the M3 spec (exporter binding if available, else nonce plus SPKI hash). Signature verification is a stub call to the monitor interface in this milestone.
 * 0-RTT disabled, Retry required, hello grace timer, max control frame size enforced.
 * Echo over stream 4 to prove the data path.
@@ -414,7 +414,7 @@ The `ssx` client: one ring, low latency, a robust terminal experience.
 
 ## Scope
 
-* CLI: `ssx [-i key] [-p port] [--approve-host] [-v] user@host[:port]`, plus subcommands `ssx keygen` and `ssx fingerprint`.
+* Historical CLI notes: `--approve-host` is retained only as an alias for the guarded interactive `--trust-new-host` flow; it does not silently enroll unknown keys.
 * **One ring** (`SINGLE_ISSUER | DEFER_TASKRUN`) driving everything:
   * TTY stdin `READ` (re-armed, small buffer, flushed immediately)
   * UDP multishot `RECVMSG`, `SENDMSG` (GSO when available)
@@ -431,7 +431,7 @@ The `ssx` client: one ring, low latency, a robust terminal experience.
 
 ## Progress
 
-* Implemented: the full CLI (target, `-i`, `-p`, `--approve-host`, `-v`, `--config`, `--check-config`, `keygen`, `fingerprint`), host aliases, `known_hosts` prompt/pin flow with a loud mismatch failure, raw mode with restore-on-drop and SIGTERM/SIGHUP handlers, resize via `SIGWINCH` + `TIOCGWINSZ` + `Resize`, OpenSSH-style escapes, and remote-exit-code propagation (verified: 0 and 7; failures exit 255).
+* Implemented: the full CLI (target, `-i`, `-p`, guarded `--trust-new-host`/legacy alias, `-v`, `--config`, `--check-config`, `keygen`, `fingerprint`), host aliases, default-deny `known_hosts` pinning, raw mode with restore-on-drop and SIGTERM/SIGHUP handlers, resize via `SIGWINCH` + `TIOCGWINSZ` + `Resize`, OpenSSH-style escapes, and remote-exit-code propagation (verified: 0 and 7; failures exit 255).
 * Not yet one ring: the client uses a main ring plus a stdin reader thread with its own ring, and falls back to direct syscalls where io_uring is restricted. There is no `signalfd` (handlers set atomic flags), no `IORING_OP_CONNECT`/`SOCKET` (std UDP socket + `quiche::connect`), and no single-tick keystroke path.
 * Type-ahead typed before raw mode is flushed by `TCSAFLUSH`; fine for normal use, noted for the test harness.
 * Not yet verified/measured: terminal restoration under kill/panic (pty-driven tests), the full escape matrix, resize/signal forwarding end to end, `strace` epoll check, and keystroke latency.

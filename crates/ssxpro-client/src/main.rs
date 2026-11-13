@@ -30,9 +30,10 @@ struct Args {
     /// Increase verbosity (repeat for more: -v, -vv, -vvv).
     #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count, default_value_t = 0)]
     verbose: u8,
-    /// Automatically approve and save a previously unknown host key.
-    #[arg(long)]
-    approve_host: bool,
+    /// Interactively enroll a host key after comparing its fingerprint out of band.
+    /// The old --approve-host spelling is accepted as a safe interactive alias.
+    #[arg(long, alias = "approve-host")]
+    trust_new_host: bool,
     /// Use this YAML configuration file instead of ~/.ssx/config.yaml.
     #[arg(short, long, value_name = "PATH")]
     config: Option<PathBuf>,
@@ -99,8 +100,8 @@ fn main() -> ExitCode {
             return ExitCode::from(3);
         }
     };
-    if args.approve_host {
-        loaded.config.known_hosts_policy = KnownHostsPolicy::Approve;
+    if args.trust_new_host {
+        loaded.config.known_hosts_policy = KnownHostsPolicy::Ask;
     }
     if args.check_config {
         println!("configuration is valid");
@@ -108,7 +109,7 @@ fn main() -> ExitCode {
     }
     let Some(raw_target) = args.target.as_deref() else {
         eprintln!(
-            "ssx: no target provided. Usage: ssx USER@HOST:PORT [--identity PATH] [--port PORT] [--approve-host] [--config PATH]"
+            "ssx: no target provided. Usage: ssx USER@HOST:PORT [--identity PATH] [--port PORT] [--trust-new-host] [--config PATH]"
         );
         return ExitCode::from(1);
     };

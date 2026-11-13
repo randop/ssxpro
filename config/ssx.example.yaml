@@ -11,4 +11,10 @@ idle_timeout_secs: 600
 server_alive_interval_secs: 15
 server_alive_count_max: 6
 known_hosts: "~/.ssx/known_hosts"
-known_hosts_policy: "ask"
+# Fail closed on unknown server keys. Provision known_hosts out of band,
+# or use --trust-new-host only after comparing the exact fingerprint.
+known_hosts_policy: "deny"
+# Optional private-CA trust. When set, certificate-chain and SAN hostname/IP
+# checks are enforced in addition to the required SPKI known-hosts pin.
+# tls:
+#   ca_bundle: "~/.ssx/ssxpro-ca.pem"

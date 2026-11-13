@@ -170,11 +170,23 @@ pub enum CompressionMode {
     High,
 }
 
+/// Server-side certificate chain configuration. The leaf certificate must
+/// contain the public key derived from `host_key`; the corresponding private
+/// key remains in the privileged monitor.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct ServerTlsConfig {
+    /// PEM leaf certificate followed by any intermediate certificates.
+    /// When omitted, ssxd generates its built-in self-signed host certificate.
+    pub certificate_chain: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
     pub listen: String,
     pub host_key: PathBuf,
+    pub tls: ServerTlsConfig,
     /// Server-enforced PTY stream compression: off, fast (LZ4),
     /// standard (Snappy), or high (Zstd level 19).
     pub compression: CompressionMode,
@@ -193,6 +205,7 @@ impl Default for ServerConfig {
         Self {
             listen: default_listen(),
             host_key: default_host_key(),
+            tls: ServerTlsConfig::default(),
             compression: default_compression(),
             workers: default_workers(),
             io: IoConfig::default(),
@@ -354,6 +367,18 @@ impl ServerConfig {
                 source,
                 "listen",
                 "must be a socket address such as 0.0.0.0:22",
+            ));
+        }
+        if self
+            .tls
+            .certificate_chain
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
+        {
+            return Err(validation_error(
+                source,
+                "tls.certificate_chain",
+                "must be an absolute path",
             ));
         }
         bounded(source, "workers", self.workers, 1, 256)?;
@@ -521,6 +546,16 @@ fn default_server_alive_count_max() -> u32 {
     6
 }
 
+/// Client-side certificate-authority configuration. When provided, the TLS
+/// certificate chain and service identity are validated in addition to the
+/// mandatory known-hosts SPKI pin check.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClientTlsConfig {
+    /// PEM bundle containing the trusted CA certificate(s).
+    pub ca_bundle: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ClientConfig {
@@ -539,6 +574,7 @@ pub struct ClientConfig {
     pub server_alive_count_max: u32,
     pub known_hosts: PathBuf,
     pub known_hosts_policy: KnownHostsPolicy,
+    pub tls: ClientTlsConfig,
 }
 impl Default for ClientConfig {
     fn default() -> Self {
@@ -552,7 +588,8 @@ impl Default for ClientConfig {
             server_alive_interval_secs: default_server_alive_interval(),
             server_alive_count_max: default_server_alive_count_max(),
             known_hosts: default_known_hosts(),
-            known_hosts_policy: KnownHostsPolicy::Ask,
+            known_hosts_policy: KnownHostsPolicy::Deny,
+            tls: ClientTlsConfig::default(),
         }
     }
 }
@@ -568,12 +605,11 @@ pub struct HostAlias {
 #[serde(rename_all = "kebab-case")]
 pub enum KnownHostsPolicy {
     /// Reject connections to hosts that are not already pinned.
-    Deny,
-    /// Prompt before accepting an unknown host key.
     #[default]
+    Deny,
+    /// Interactively enroll an unknown host key. The user must type the full
+    /// fingerprint after comparing it with an independently obtained value.
     Ask,
-    /// Accept and save an unknown host key without prompting.
-    Approve,
 }
 
 impl ClientConfig {
@@ -645,6 +681,18 @@ impl ClientConfig {
                     "must be between 1 and 65535",
                 ));
             }
+        }
+        if self
+            .tls
+            .ca_bundle
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            return Err(validation_error(
+                source,
+                "tls.ca_bundle",
+                "must not be empty",
+            ));
         }
         Ok(())
     }
@@ -784,20 +832,38 @@ mod tests {
     }
 
     #[test]
-    fn client_known_hosts_policy_defaults_to_ask() {
+    fn client_known_hosts_policy_defaults_to_deny() {
         let client = parse_client_yaml("").expect("empty client config uses defaults");
-        assert_eq!(client.known_hosts_policy, KnownHostsPolicy::Ask);
+        assert_eq!(client.known_hosts_policy, KnownHostsPolicy::Deny);
 
         let client = parse_client_yaml("known_hosts_policy: deny\n").expect("deny policy accepted");
         assert_eq!(client.known_hosts_policy, KnownHostsPolicy::Deny);
         let client = parse_client_yaml("known_hosts_policy: ask\n").expect("ask policy accepted");
         assert_eq!(client.known_hosts_policy, KnownHostsPolicy::Ask);
-        let client =
-            parse_client_yaml("known_hosts_policy: approve\n").expect("approve policy accepted");
-        assert_eq!(client.known_hosts_policy, KnownHostsPolicy::Approve);
 
+        assert!(parse_client_yaml("known_hosts_policy: approve\n").is_err());
         assert!(parse_client_yaml("known_hosts_policy: reject\n").is_err());
         assert!(parse_client_yaml("known_hosts_policy: accept-new\n").is_err());
+    }
+
+    #[test]
+    fn tls_paths_are_accepted_and_empty_ca_bundle_is_rejected() {
+        let client = parse_client_yaml("tls:\n  ca_bundle: ~/.ssx/ssxpro-ca.pem\n")
+            .expect("CA bundle path accepted");
+        assert_eq!(
+            client.tls.ca_bundle,
+            Some(std::path::PathBuf::from("~/.ssx/ssxpro-ca.pem"))
+        );
+        assert!(parse_client_yaml("tls:\n  ca_bundle: ''\n").is_err());
+
+        let server =
+            parse_server_yaml("tls:\n  certificate_chain: /etc/ssx/server-fullchain.pem\n")
+                .expect("absolute server certificate path accepted");
+        assert_eq!(
+            server.tls.certificate_chain,
+            Some(std::path::PathBuf::from("/etc/ssx/server-fullchain.pem"))
+        );
+        assert!(parse_server_yaml("tls:\n  certificate_chain: relative.pem\n").is_err());
     }
 
     #[test]

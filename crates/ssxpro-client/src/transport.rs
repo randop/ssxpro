@@ -7,9 +7,8 @@ use ssxpro_compression::{
 };
 use ssxpro_config::KnownHostsPolicy;
 use ssxpro_crypto::{
-    append_user_file, auth_signing_bytes, fingerprint_spki, getrandom, parse_known_hosts,
-    read_private_key, read_user_file, sha256, verify_known_host, CryptoError, Ed25519Keypair,
-    HostKeyError,
+    append_user_file, auth_signing_bytes, getrandom, parse_known_hosts, read_private_key,
+    read_user_file, sha256, verify_known_host, CryptoError, Ed25519Keypair, HostKeyError,
 };
 use ssxpro_io::{RuntimeRing, UdpEndpoint};
 use ssxpro_proto::{
@@ -18,7 +17,7 @@ use ssxpro_proto::{
 };
 use std::collections::VecDeque;
 use std::io::Write;
-use std::net::ToSocketAddrs;
+use std::net::{IpAddr, ToSocketAddrs};
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -169,14 +168,77 @@ pub fn connect_and_echo(
     )?;
     endpoint.set_receive_timeout(Duration::from_millis(100))?;
     let local = endpoint.local_addr()?;
-    // BoringSSL's default verify (client-advertised) signature algorithms omit
-    // Ed25519, while the server identity is an Ed25519 certificate. Without an
-    // explicit preference list the server fails the handshake with
-    // NO_COMMON_SIGNATURE_ALGORITHMS.
+    // The server leaf key is Ed25519, while a CA may sign the leaf with a
+    // mainstream RSA or ECDSA key. Advertise modern SHA-2 certificate-chain
+    // signature algorithms as well as Ed25519 so CA mode works with common
+    // private PKIs without permitting SHA-1/MD5 signatures.
     let mut ssl = boring::ssl::SslContextBuilder::new(boring::ssl::SslMethod::tls())?;
-    ssl.set_verify_algorithm_prefs(&[boring::ssl::SslSignatureAlgorithm::ED25519])?;
+    ssl.set_verify_algorithm_prefs(&[
+        boring::ssl::SslSignatureAlgorithm::ED25519,
+        boring::ssl::SslSignatureAlgorithm::ECDSA_SECP256R1_SHA256,
+        boring::ssl::SslSignatureAlgorithm::ECDSA_SECP384R1_SHA384,
+        boring::ssl::SslSignatureAlgorithm::ECDSA_SECP521R1_SHA512,
+        boring::ssl::SslSignatureAlgorithm::RSA_PSS_RSAE_SHA256,
+        boring::ssl::SslSignatureAlgorithm::RSA_PSS_RSAE_SHA384,
+        boring::ssl::SslSignatureAlgorithm::RSA_PSS_RSAE_SHA512,
+        boring::ssl::SslSignatureAlgorithm::RSA_PKCS1_SHA256,
+        boring::ssl::SslSignatureAlgorithm::RSA_PKCS1_SHA384,
+        boring::ssl::SslSignatureAlgorithm::RSA_PKCS1_SHA512,
+    ])?;
+    ssl.set_min_proto_version(Some(boring::ssl::SslVersion::TLS1_3))?;
+    ssl.set_max_proto_version(Some(boring::ssl::SslVersion::TLS1_3))?;
+    ssl.set_options(boring::ssl::SslOptions::NO_TICKET);
+    ssl.set_session_cache_mode(boring::ssl::SslSessionCacheMode::OFF);
+    // Determine SNI: for IP addresses, don't set SNI (RFC 6066 forbids IP
+    // literals). The SAN check performed below uses the connection target.
+    let sni = if hostname.parse::<std::net::IpAddr>().is_ok() {
+        debug2!(
+            verbose,
+            "hostname {hostname} is an IP literal; SNI omitted, IP SAN verification applies"
+        );
+        None
+    } else {
+        Some(hostname)
+    };
     let mut tls = quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, ssl)?;
-    tls.verify_peer(false);
+    let ca_bundle = client_config
+        .tls
+        .ca_bundle
+        .as_ref()
+        .map(|path| expand_tilde(&home, path));
+    debug2!(
+        verbose,
+        "TLS policy: ca_bundle={:?} known_hosts_policy={:?}",
+        ca_bundle.as_deref().map(|path| path.display().to_string()),
+        client_config.known_hosts_policy
+    );
+    if let Some(path) = &ca_bundle {
+        let path = path
+            .to_str()
+            .ok_or("TLS CA bundle path is not valid UTF-8")?;
+        debug2!(verbose, "loading CA bundle {path}");
+        tls.load_verify_locations_from_file(path)?;
+        tls.verify_peer(true);
+        debug1!(verbose, "TLS certificate-chain verification enabled");
+    } else {
+        // Legacy self-signed deployments use the mandatory SPKI known-hosts
+        // pin as their trust anchor. Unknown pins are rejected by default.
+        tls.verify_peer(false);
+        debug1!(
+            verbose,
+            "TLS CA verification disabled; strict SPKI pinning is required"
+        );
+    }
+    debug2!(
+        verbose,
+        "peer verification {}; ALPN {:?}",
+        if ca_bundle.is_some() {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        String::from_utf8_lossy(ssxpro_proto::ALPN)
+    );
     tls.set_application_protos(&[ssxpro_proto::ALPN])?;
     // QUIC idle timeout: 0 means the peer's timeout is not capped locally.
     // This is intentionally separate from handshake_timeout_secs; reusing the
@@ -189,7 +251,7 @@ pub fn connect_and_echo(
     let mut scid = [0u8; 16];
     getrandom(&mut scid)?;
     let scid = quiche::ConnectionId::from_ref(&scid);
-    let mut conn = quiche::connect(Some(hostname), &scid, local, peer, &mut tls)?;
+    let mut conn = quiche::connect(sni, &scid, local, peer, &mut tls)?;
     debug1!(verbose, "TLS handshake initiated to {hostname}:{port}");
     let mut packet = [0u8; 65536];
     let mut output = [0u8; 65536];
@@ -212,7 +274,11 @@ pub fn connect_and_echo(
                 match conn.recv(&mut packet[..length], quiche::RecvInfo { from, to: local }) {
                     Ok(n) => debug3!(verbose, "conn.recv processed {n} bytes"),
                     Err(e) => {
-                        debug3!(verbose, "conn.recv error: {e}");
+                        debug2!(
+                            verbose,
+                            "TLS handshake failed after {length} bytes from {from}: {e} (peer alert: {:?})",
+                            conn.peer_error()
+                        );
                         return Err(Box::new(e));
                     }
                 }
@@ -248,33 +314,55 @@ pub fn connect_and_echo(
         }
     }
     if !conn.is_established() {
+        debug2!(
+            verbose,
+            "handshake unfinished after {}s (established=false, closed={}, peer_error={:?})",
+            client_config.handshake_timeout_secs,
+            conn.is_closed(),
+            conn.peer_error()
+        );
         return Err("handshake did not complete before deadline".into());
     }
     debug1!(verbose, "TLS handshake established with {hostname}:{port}");
+    debug2!(
+        verbose,
+        "negotiated ALPN: {:?}",
+        String::from_utf8_lossy(conn.application_proto())
+    );
     if !pin_checked {
-        if let Some(cert_der) = conn.peer_cert() {
-            let cert = X509::from_der(cert_der)?;
-            let spki = cert.public_key()?.public_key_to_der()?;
-            debug1!(
-                verbose,
-                "server certificate received ({} bytes)",
-                cert_der.len()
-            );
-            debug2!(
-                verbose,
-                "server SPKI: {}",
-                ssxpro_crypto::fingerprint_spki(&spki).unwrap_or_default()
-            );
-            check_or_trust_host(
-                &home,
-                &client_config.known_hosts,
-                &format!("{hostname}:{port}"),
-                &spki,
-                client_config.known_hosts_policy,
-            )?;
+        let cert_der = conn
+            .peer_cert()
+            .ok_or("server did not present a TLS certificate")?;
+        let cert = X509::from_der(cert_der)?;
+        if ca_bundle.is_some() {
+            debug2!(verbose, "verifying certificate SAN against '{hostname}'");
+            verify_server_certificate_name(&cert, hostname)?;
+            debug2!(verbose, "certificate SAN matched '{hostname}'");
         }
+        let spki = cert.public_key()?.public_key_to_der()?;
+        debug1!(
+            verbose,
+            "server certificate received ({} bytes)",
+            cert_der.len()
+        );
+        debug2!(
+            verbose,
+            "server SPKI: {}",
+            ssxpro_crypto::fingerprint_spki(&spki).unwrap_or_default()
+        );
+        check_or_trust_host(
+            &home,
+            &client_config.known_hosts,
+            &format!("{hostname}:{port}"),
+            &spki,
+            client_config.known_hosts_policy,
+            verbose,
+        )?;
         pin_checked = true;
-        debug1!(verbose, "host key verified for {hostname}:{port}");
+        debug1!(
+            verbose,
+            "host certificate and SPKI identity verified for {hostname}:{port}"
+        );
     }
     // --- Control phase: Hello -> AuthChallenge -> AuthRequest -> AuthOk.
     // The handshake may have consumed part of the original deadline, so
@@ -883,22 +971,75 @@ fn read_known_hosts(home: &Path, path: &Path) -> Result<String, Box<dyn std::err
     Ok(String::from_utf8(bytes)?)
 }
 
+fn verify_server_certificate_name(
+    certificate: &X509,
+    hostname: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // RFC 9525 service identity checks are based on SAN identifiers, not the
+    // legacy subject commonName. Require SAN explicitly before checking DNS/IP.
+    let sans = certificate
+        .subject_alt_names()
+        .ok_or("CA-verified server certificate has no subjectAltName extension")?;
+    if sans.is_empty() {
+        return Err("CA-verified server certificate has an empty subjectAltName extension".into());
+    }
+    // Match only the relevant SAN GeneralName type. In particular, do not let
+    // the deprecated subject CN satisfy DNS verification when a certificate
+    // also contains an unrelated SAN entry.
+    let matches = match hostname.parse::<IpAddr>() {
+        Ok(IpAddr::V4(expected)) => {
+            let expected_octets = expected.octets();
+            sans.iter().any(|name| {
+                name.ipaddress()
+                    .is_some_and(|address| address == expected_octets.as_slice())
+            })
+        }
+        Ok(IpAddr::V6(expected)) => {
+            let expected_octets = expected.octets();
+            sans.iter().any(|name| {
+                name.ipaddress()
+                    .is_some_and(|address| address == expected_octets.as_slice())
+            })
+        }
+        Err(_) => sans.iter().any(|name| {
+            name.dnsname()
+                .is_some_and(|dns_name| dns_name_matches_host(dns_name, hostname))
+        }),
+    };
+    if !matches {
+        return Err(
+            format!("server certificate subjectAltName does not match '{hostname}'").into(),
+        );
+    }
+    Ok(())
+}
+
+fn dns_name_matches_host(pattern: &str, hostname: &str) -> bool {
+    let pattern = pattern.to_ascii_lowercase();
+    let hostname = hostname.to_ascii_lowercase();
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        if suffix.is_empty() || suffix.contains('*') {
+            return false;
+        }
+        return hostname.ends_with(&format!(".{suffix}"))
+            && hostname
+                .strip_suffix(&format!(".{suffix}"))
+                .is_some_and(|leftmost| !leftmost.is_empty() && !leftmost.contains('.'));
+    }
+    !pattern.contains('*') && pattern == hostname
+}
+
 fn prompt_to_trust_host(host: &str, fingerprint: &str) -> Result<bool, Box<dyn std::error::Error>> {
     eprintln!("The authenticity of host '{host}' cannot be established.");
-    eprintln!("Server key fingerprint: {fingerprint}");
-    loop {
-        eprint!("Allow this host? (y/N) ");
-        std::io::stderr().flush()?;
-        let mut answer = String::new();
-        if std::io::stdin().read_line(&mut answer)? == 0 {
-            return Ok(false);
-        }
-        match answer.trim().to_ascii_lowercase().as_str() {
-            "y" | "yes" => return Ok(true),
-            "" | "n" | "no" => return Ok(false),
-            _ => eprintln!("Please answer 'y' or 'n'."),
-        }
+    eprintln!("Server SPKI SHA-256 (base64): {fingerprint}");
+    eprintln!("Compare this exact value with `ssxd --print-host-pin` obtained through a trusted, independent channel.");
+    eprint!("Type the full base64 fingerprint to enroll this host (anything else rejects): ");
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer)? == 0 {
+        return Ok(false);
     }
+    Ok(answer.trim() == fingerprint)
 }
 
 fn check_or_trust_host(
@@ -907,36 +1048,59 @@ fn check_or_trust_host(
     host: &str,
     spki: &[u8],
     policy: KnownHostsPolicy,
+    verbose: u8,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let default_known_path = home.join(".ssx/known_hosts");
     let known_path = expand_tilde(home, configured_path);
+    debug2!(
+        verbose,
+        "checking known_hosts pin for {host} in {}",
+        known_path.display()
+    );
     let known = read_known_hosts(home, &known_path)?;
     let entries = parse_known_hosts(&known)?;
+    debug2!(verbose, "loaded {} known_hosts entr(ies)", entries.len());
     match verify_known_host(&entries, host, spki) {
-        Ok(()) => Ok(()),
-        Err(HostKeyError::Mismatch) => Err(HostKeyError::Mismatch.into()),
+        Ok(()) => {
+            debug2!(verbose, "SPKI pin matched for {host}");
+            Ok(())
+        }
+        Err(HostKeyError::Mismatch) => {
+            debug2!(verbose, "SPKI pin mismatch for {host}; refusing connection");
+            Err(HostKeyError::Mismatch.into())
+        }
         Err(HostKeyError::UnknownHost) => {
             if known_path != default_known_path {
+                debug2!(
+                    verbose,
+                    "{host} is not pinned and {} is a custom known_hosts file",
+                    known_path.display()
+                );
                 return Err(format!(
                     "host {host} is not pinned in {}; custom known_hosts files are never modified automatically",
                     known_path.display()
                 )
                 .into());
             }
-            let fingerprint = fingerprint_spki(spki)?;
+            debug2!(
+                verbose,
+                "{host} is unknown; applying known_hosts_policy={policy:?}"
+            );
+            // Match `ssxd --print-host-pin` and the known_hosts wire format:
+            // standard padded base64 of SHA-256(DER SubjectPublicKeyInfo).
+            let fingerprint = STANDARD.encode(sha256(spki)?);
             match policy {
                 KnownHostsPolicy::Deny => {
                     return Err(format!(
-                        "host key for {host} is unknown and known_hosts_policy is deny (fingerprint {fingerprint})"
+                        "host key for {host} is unknown and known_hosts_policy is deny (fingerprint {fingerprint}); provision this pin out of band or use --trust-new-host after independent verification"
                     )
                     .into())
                 }
                 KnownHostsPolicy::Ask => {
                     if !prompt_to_trust_host(host, &fingerprint)? {
-                        return Err("host key was not accepted".into());
+                        return Err("host key fingerprint was not confirmed".into());
                     }
                 }
-                KnownHostsPolicy::Approve => {}
             }
             let hash = sha256(spki)?;
             let line = format!("{host} spki-sha256 {}\n", STANDARD.encode(hash));
@@ -1062,52 +1226,88 @@ mod tests {
     }
 
     #[test]
-    fn approve_policy_creates_secure_default_known_hosts() {
-        let home = temp_home("known-hosts");
+    fn dns_san_matching_is_exact_or_single_label_wildcard() {
+        assert!(dns_name_matches_host(
+            "shell.example.test",
+            "SHELL.EXAMPLE.TEST"
+        ));
+        assert!(dns_name_matches_host("*.example.test", "node.example.test"));
+        assert!(!dns_name_matches_host(
+            "*.example.test",
+            "a.node.example.test"
+        ));
+        assert!(!dns_name_matches_host("*.example.test", "example.test"));
+        assert!(!dns_name_matches_host(
+            "shell.example.test",
+            "other.example.test"
+        ));
+        assert!(!dns_name_matches_host(
+            "s*.example.test",
+            "shell.example.test"
+        ));
+    }
+
+    #[test]
+    fn san_verification_rejects_wrong_names_on_e2e_leaf_certificate() {
+        // Use the bootstrap-generated leaf certificate when present; the
+        // check is skipped otherwise so unit tests run on a clean checkout.
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root");
+        let cert_path = repo.join("target/e2e/server_cert.pem");
+        if !cert_path.exists() {
+            eprintln!("skipping: {} not present", cert_path.display());
+            return;
+        }
+        let pem = std::fs::read(&cert_path).unwrap();
+        let cert = X509::from_pem(&pem).unwrap();
+
+        // A name that is definitely not in the SAN must be rejected.
+        assert!(
+            verify_server_certificate_name(&cert, "absolutely-not-a-san.invalid").is_err(),
+            "a non-SAN name must fail verification"
+        );
+
+        // Every SAN entry in the bootstrap certificate must verify.
+        let sans = cert.subject_alt_names().expect("e2e leaf has SAN");
+        assert!(!sans.is_empty());
+        for name in sans.iter() {
+            let expected = name.dnsname().map(str::to_owned).or_else(|| {
+                name.ipaddress().map(|raw| match raw.len() {
+                    4 => std::net::Ipv4Addr::new(raw[0], raw[1], raw[2], raw[3]).to_string(),
+                    16 => {
+                        let mut octets = [0u8; 16];
+                        octets.copy_from_slice(raw);
+                        std::net::Ipv6Addr::from(octets).to_string()
+                    }
+                    _ => unreachable!("IP SAN must be 4 or 16 bytes"),
+                })
+            });
+            if let Some(expected) = expected {
+                verify_server_certificate_name(&cert, &expected)
+                    .unwrap_or_else(|error| panic!("SAN {expected:?} must verify, got: {error}"));
+            }
+        }
+    }
+
+    #[test]
+    fn deny_policy_does_not_enroll_unknown_host() {
+        let home = temp_home("known-hosts-deny");
         let key = Ed25519Keypair::from_seed([9; 32]).unwrap();
         let spki = key.public_key().to_spki_der();
         let configured = Path::new("~/.ssx/known_hosts");
 
-        check_or_trust_host(
-            &home,
-            configured,
-            "example.test:22",
-            &spki,
-            KnownHostsPolicy::Approve,
-        )
-        .expect("approve policy saves an unknown host");
-        let path = home.join(".ssx/known_hosts");
-        let contents = std::fs::read_to_string(&path).unwrap();
-        assert!(contents.starts_with("example.test:22 spki-sha256 "));
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        assert_eq!(
-            std::fs::metadata(home.join(".ssx"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o700
-        );
-
-        check_or_trust_host(
-            &home,
-            configured,
-            "example.test:22",
-            &spki,
-            KnownHostsPolicy::Deny,
-        )
-        .expect("the saved pin is accepted under deny");
         assert!(check_or_trust_host(
             &home,
             configured,
-            "other.test:22",
+            "example.test:22",
             &spki,
             KnownHostsPolicy::Deny,
+            0,
         )
         .is_err());
+        assert!(!home.join(".ssx/known_hosts").exists());
         std::fs::remove_dir_all(home).unwrap();
     }
 }

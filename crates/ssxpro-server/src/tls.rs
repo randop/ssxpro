@@ -3,8 +3,8 @@ use boring::bn::BigNum;
 use boring::hash::MessageDigest;
 use boring::nid::Nid;
 use boring::ssl::{
-    PrivateKeyMethod, PrivateKeyMethodError, SslContextBuilder, SslMethod, SslRef,
-    SslSignatureAlgorithm,
+    PrivateKeyMethod, PrivateKeyMethodError, SslContextBuilder, SslMethod, SslOptions, SslRef,
+    SslSessionCacheMode, SslSignatureAlgorithm, SslVersion,
 };
 use boring::x509::{X509NameBuilder, X509};
 use ssxpro_crypto::{
@@ -269,14 +269,68 @@ pub fn identity_from_seed(mut seed: [u8; 32]) -> Result<TlsIdentity, Box<dyn std
     })
 }
 
+const MAX_TLS_CERTIFICATE_CHAIN_BYTES: usize = 256 * 1024;
+const MAX_TLS_CERTIFICATES: usize = 8;
+
+/// Parse a PEM chain and ensure its leaf certificate uses the key protected by
+/// the privileged monitor. A mismatch is a startup error, not a handshake-time
+/// surprise.
+pub fn validate_certificate_chain_pem(
+    pem: &[u8],
+    expected_spki: &[u8],
+) -> Result<Vec<X509>, Box<dyn std::error::Error>> {
+    if pem.is_empty() || pem.len() > MAX_TLS_CERTIFICATE_CHAIN_BYTES {
+        return Err("TLS certificate chain must be 1..=262144 bytes".into());
+    }
+    let certificates = X509::stack_from_pem(pem)?;
+    if certificates.is_empty() || certificates.len() > MAX_TLS_CERTIFICATES {
+        return Err("TLS certificate chain must contain 1..=8 certificates".into());
+    }
+    let leaf_spki = certificates[0].public_key()?.public_key_to_der()?;
+    if leaf_spki != expected_spki {
+        return Err(
+            "TLS leaf certificate public key does not match the configured host key".into(),
+        );
+    }
+    // An expired or not-yet-valid leaf can only fail at handshake time after
+    // the server is already accepting traffic; reject it at startup instead.
+    let now = Asn1Time::days_from_now(0)?;
+    if certificates[0].not_before().compare(&now)? == std::cmp::Ordering::Greater {
+        return Err("TLS leaf certificate is not yet valid".into());
+    }
+    if certificates[0].not_after().compare(&now)? == std::cmp::Ordering::Less {
+        return Err("TLS leaf certificate is expired".into());
+    }
+    Ok(certificates)
+}
+
 pub fn server_config_with_signer(
     identity: &TlsIdentity,
     signer: IpcSigner,
     idle_timeout_ms: u64,
+    certificate_chain_path: Option<&Path>,
 ) -> Result<(quiche::Config, Vec<u8>), Box<dyn std::error::Error>> {
-    let certificate = X509::from_der(&identity.certificate_der)?;
     let mut ssl = SslContextBuilder::new(SslMethod::tls())?;
-    ssl.set_certificate(&certificate)?;
+    // QUIC requires TLS 1.3. Pin the BoringSSL context as defense in depth
+    // against future configuration changes or dependency behavior changes.
+    ssl.set_min_proto_version(Some(SslVersion::TLS1_3))?;
+    ssl.set_max_proto_version(Some(SslVersion::TLS1_3))?;
+    // Protocol v1 deliberately does not resume sessions or issue TLS 1.3
+    // tickets. Early data is not enabled anywhere in the application.
+    ssl.set_options(SslOptions::NO_TICKET);
+    ssl.set_session_cache_mode(SslSessionCacheMode::OFF);
+
+    if let Some(path) = certificate_chain_path {
+        let pem = std::fs::read(path)?;
+        let certificates = validate_certificate_chain_pem(&pem, &identity.spki_der)?;
+        ssl.set_certificate(&certificates[0])?;
+        for certificate in certificates.into_iter().skip(1) {
+            ssl.add_extra_chain_cert(certificate)?;
+        }
+    } else {
+        let certificate = X509::from_der(&identity.certificate_der)?;
+        ssl.set_certificate(&certificate)?;
+    }
     ssl.set_private_key_method(signer);
     let mut config = quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, ssl)?;
     config.set_application_protos(&[ssxpro_proto::ALPN])?;
@@ -710,10 +764,83 @@ mod tests {
     }
 
     #[test]
+    fn configured_certificate_chain_must_match_monitor_host_key() {
+        let identity = identity_from_seed([7; 32]).unwrap();
+        let certificate = X509::from_der(&identity.certificate_der).unwrap();
+        let pem = certificate.to_pem().unwrap();
+        validate_certificate_chain_pem(&pem, &identity.spki_der)
+            .expect("the matching host certificate is accepted");
+
+        let other = identity_from_seed([8; 32]).unwrap();
+        assert!(validate_certificate_chain_pem(&pem, &other.spki_der).is_err());
+    }
+
+    #[test]
+    fn certificate_chain_rejects_empty_and_oversized_pem() {
+        let identity = identity_from_seed([7; 32]).unwrap();
+        assert!(validate_certificate_chain_pem(&[], &identity.spki_der).is_err());
+        assert!(validate_certificate_chain_pem(
+            &vec![b'A'; MAX_TLS_CERTIFICATE_CHAIN_BYTES + 1],
+            &identity.spki_der,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn makes_a_certificate_from_the_host_seed() {
         let identity = identity_from_seed([7; 32]).unwrap();
         assert!(!identity.certificate_der.is_empty());
         assert!(!identity.spki_der.is_empty());
+    }
+
+    #[test]
+    fn parses_bootstrap_generated_certificate_chain() {
+        // Parse a bootstrap-generated chain when the e2e artifacts exist;
+        // otherwise skip so unit tests stay runnable on a clean checkout.
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root");
+        let chain_path = repo.join("target/e2e/server-fullchain.pem");
+        if !chain_path.exists() {
+            eprintln!("skipping: {} not present", chain_path.display());
+            return;
+        }
+        let pem = std::fs::read(&chain_path).unwrap();
+        let certificates = X509::stack_from_pem(&pem).unwrap();
+        assert!(certificates.len() >= 2, "chain should contain leaf and CA");
+        // The first certificate is the leaf; the last is the issuing CA.
+        let leaf_subject = certificates[0]
+            .subject_name()
+            .entries()
+            .next()
+            .unwrap()
+            .data()
+            .as_utf8()
+            .unwrap()
+            .to_string();
+        let ca_subject = certificates[certificates.len() - 1]
+            .subject_name()
+            .entries()
+            .next()
+            .unwrap()
+            .data()
+            .as_utf8()
+            .unwrap()
+            .to_string();
+        assert_eq!(leaf_subject, "ssxpro-e2e-server");
+        assert_eq!(ca_subject, "ssxpro-e2e-CA");
+
+        // The chain must validate against the leaf SPKI (the e2e chain is
+        // issued for the bootstrap host key, not this unit test's identity).
+        let leaf_spki = certificates[0]
+            .public_key()
+            .unwrap()
+            .public_key_to_der()
+            .unwrap();
+        assert!(validate_certificate_chain_pem(&pem, &leaf_spki).is_ok());
+        let other = identity_from_seed([8; 32]).unwrap();
+        assert!(validate_certificate_chain_pem(&pem, &other.spki_der).is_err());
     }
 
     #[test]
