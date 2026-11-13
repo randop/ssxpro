@@ -1016,7 +1016,10 @@ fn verify_server_certificate_name(
 
 fn dns_name_matches_host(pattern: &str, hostname: &str) -> bool {
     let pattern = pattern.to_ascii_lowercase();
-    let hostname = hostname.to_ascii_lowercase();
+    let hostname = hostname
+        .strip_suffix('.')
+        .unwrap_or(hostname)
+        .to_ascii_lowercase();
     if let Some(suffix) = pattern.strip_prefix("*.") {
         if suffix.is_empty() || suffix.contains('*') {
             return false;
@@ -1232,6 +1235,22 @@ mod tests {
             "SHELL.EXAMPLE.TEST"
         ));
         assert!(dns_name_matches_host("*.example.test", "node.example.test"));
+        assert!(dns_name_matches_host(
+            "node.example.test",
+            "NODE.example.test."
+        ));
+        assert!(dns_name_matches_host(
+            "*.example.test",
+            "NODE.example.test."
+        ));
+        assert!(!dns_name_matches_host(
+            "node.example.test",
+            "node.example.test.."
+        ));
+        assert!(!dns_name_matches_host(
+            "*.example.test",
+            "node.example.test.."
+        ));
         assert!(!dns_name_matches_host(
             "*.example.test",
             "a.node.example.test"

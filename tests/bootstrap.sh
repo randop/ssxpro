@@ -315,10 +315,12 @@ generate_tls_artifacts() {
     rm -f "$SSXD_SERVER_KEY.der"
 
     # Generate server CSR with SAN for the test host
-    local san="IP:127.0.0.1"
-    [[ "$HOST" != "127.0.0.1" && "$HOST" != "localhost" ]] && san="$san,DNS:$HOST"
-    [[ "$HOST" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && san="IP:$HOST"
-    [[ "$HOST" =~ ^\[.*\]$ ]] && san="IP:${HOST//[\[\]]/}"
+    local san
+    if [[ "$HOST" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ || "$HOST" == *:* ]]; then
+        san="IP:$HOST"
+    else
+        san="IP:127.0.0.1,DNS:$HOST"
+    fi
 
     openssl req -new -key "$SSXD_SERVER_KEY" -sha256 \
         -subj "/CN=ssxpro-e2e-server" \
@@ -432,7 +434,7 @@ write_keys() {
 write_client_config() {
     cat > "$SSXD_CLIENT_CONFIG" <<YAML
 hosts: {}
-identity: "$SSXD_IDENTITY"
+identity: "${PRESET_IDENTITY:-$SSXD_IDENTITY}"
 port: $PORT
 connect_timeout_secs: 10
 handshake_timeout_secs: 15
@@ -515,18 +517,6 @@ stop_server() {
 }
 
 start_server() {
-    mkdir -p "$WORK"
-    chmod 700 "$WORK"
-
-    require_openssl
-    resolve_ssxd
-    check_test_user
-    export_test_env
-    write_config
-    write_keys
-    generate_tls_artifacts
-    write_client_config
-
     # Refuse to stack a second server on the same artifacts; recover from
     # stale pid files (dead process, zombie, or a recycled pid).
     if [ -f "$SSXD_PID_FILE" ]; then
@@ -540,6 +530,18 @@ start_server() {
         warn "removing stale pid file $SSXD_PID_FILE"
         rm -f "$SSXD_PID_FILE"
     fi
+
+    mkdir -p "$WORK"
+    chmod 700 "$WORK"
+
+    require_openssl
+    resolve_ssxd
+    check_test_user
+    export_test_env
+    write_config
+    write_keys
+    generate_tls_artifacts
+    write_client_config
 
     preflight_check_config
 
