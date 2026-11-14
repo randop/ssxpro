@@ -35,6 +35,10 @@
 #                          32-byte seed kept in SSX_E2E_WORK
 #   SSX_E2E_KNOWN_HOSTS    pinned-hosts file; default: a generated pin file
 #                          in SSX_E2E_WORK
+#   SSX_E2E_CLIENT_CONFIG  generated client config; default: in SSX_E2E_WORK
+#   SSX_E2E_CA_BUNDLE      generated trusted CA; default: in SSX_E2E_WORK
+#   SSX_E2E_UNTRUSTED_CA   generated unrelated CA for negative tests;
+#                          default: in SSX_E2E_WORK
 #
 # Exit codes: 0 success; 1 runtime failure (server died, readiness
 # timeout, already running); 2 usage or preflight failure. With `--`
@@ -50,6 +54,13 @@
 #   ssxd.log               running server log
 #   ssxd.pid               server pid while it runs
 #   test.env               exports to `source` before tests/ssx_e2e.py
+#   ca.pem                 self-signed CA certificate (client trust anchor)
+#   ca_key.pem             CA private key (test-only; never ship this)
+#   ca_untrusted.pem       unrelated CA for the untrusted-CA e2e scenario
+#   server-fullchain.pem   server certificate chain (leaf + CA)
+#   server_cert.pem        server leaf certificate (same key as host_ed25519)
+#   server_key.pem         PEM form of the host key (test-only)
+#   client_config.yaml     generated client configuration with TLS settings
 
 set -Eeuo pipefail
 umask 077
@@ -74,13 +85,20 @@ SSXD_IDENTITY="$WORK/identity_ed25519"
 SSXD_AUTHORIZED_KEYS="$WORK/authorized_keys"
 SSXD_KNOWN_HOSTS="$WORK/known_hosts.bootstrap"
 SSXD_ENV_FILE="$WORK/test.env"
+# TLS artifacts
+SSXD_CA_KEY="$WORK/ca_key.pem"
+SSXD_CA_CERT="$WORK/ca.pem"
+SSXD_SERVER_KEY="$WORK/server_key.pem"
+SSXD_SERVER_CERT="$WORK/server_cert.pem"
+SSXD_SERVER_CHAIN="$WORK/server-fullchain.pem"
+SSXD_UNTRUSTED_CA_CERT="$WORK/ca_untrusted.pem"
+SSXD_CLIENT_CONFIG="$WORK/client_config.yaml"
 
 MODE="start"
 RUN_CMD=()
 SSXD_PID=
 START_COMPLETED=0
 LAUNCHED_HERE=0
-ALLOW_ROOT=false
 
 # Operator presets, captured before this script exports its own defaults.
 PRESET_IDENTITY="${SSX_E2E_IDENTITY:-}"
@@ -203,9 +221,11 @@ check_test_user() {
         || die 2 "shell '$pw_shell' of user '$TEST_USER' is not listed in /etc/shells (append it, or run: chsh -s /bin/sh $TEST_USER)"
     [ -x "$pw_shell" ] || die 2 "shell '$pw_shell' is not executable"
 
+    # The generated ssxd.yaml sets auth.allow_root: true so the same test
+    # server works whether the operator runs the e2e suite as root or as an
+    # unprivileged account.
     if [ "$pw_uid" -eq 0 ]; then
-        ALLOW_ROOT=true
-        log "test user '$TEST_USER' is root; setting auth.allow_root: true in $SSXD_CONFIG"
+        log "test user '$TEST_USER' is root; $SSXD_CONFIG allows root logins"
     fi
 }
 
@@ -228,6 +248,9 @@ export_test_env() {
     fi
     export SSX_E2E_HOST=$HOST SSX_E2E_PORT=$PORT SSX_E2E_USER=$TEST_USER SSX_E2E_WORK=$WORK
     export SSX_E2E_COMPRESSION=$SSXD_COMPRESSION
+    export SSX_E2E_CLIENT_CONFIG=$SSXD_CLIENT_CONFIG
+    export SSX_E2E_CA_BUNDLE=$SSXD_CA_CERT
+    export SSX_E2E_UNTRUSTED_CA=$SSXD_UNTRUSTED_CA_CERT
 
     if [ -n "$PRESET_SSX_BIN" ]; then
         [ -x "$PRESET_SSX_BIN" ] || warn "SSX_BIN=$PRESET_SSX_BIN is not executable; tests/ssx_e2e.py will fail"
@@ -251,6 +274,9 @@ write_env_file() {
         printf 'export SSX_E2E_COMPRESSION=%s\n' "$(shquote "$SSXD_COMPRESSION")"
         printf 'export SSX_E2E_IDENTITY=%s\n' "$(shquote "${SSX_E2E_IDENTITY:-}")"
         printf 'export SSX_E2E_KNOWN_HOSTS=%s\n' "$(shquote "${SSX_E2E_KNOWN_HOSTS:-}")"
+        printf 'export SSX_E2E_CLIENT_CONFIG=%s\n' "$(shquote "$SSXD_CLIENT_CONFIG")"
+        printf 'export SSX_E2E_CA_BUNDLE=%s\n' "$(shquote "$SSXD_CA_CERT")"
+        printf 'export SSX_E2E_UNTRUSTED_CA=%s\n' "$(shquote "$SSXD_UNTRUSTED_CA_CERT")"
         if [ -n "${SSX_BIN:-}" ]; then
             printf 'export SSX_BIN=%s\n' "$(shquote "$SSX_BIN")"
         fi
@@ -260,6 +286,80 @@ write_env_file() {
 # ---------------------------------------------------------------------------
 # Artifact generation.
 # ---------------------------------------------------------------------------
+
+# Generate a self-signed CA and a server certificate signed by it.
+# The server certificate MUST use the same key as the host_key (monitor signing key)
+# so that the SPKI fingerprint matches the known_hosts pin.
+generate_tls_artifacts() {
+    log "generating CA and server certificate chain"
+
+    # Generate CA private key (Ed25519)
+    openssl genpkey -algorithm Ed25519 -out "$SSXD_CA_KEY" 2>/dev/null
+    chmod 600 "$SSXD_CA_KEY"
+
+    # Generate self-signed CA certificate
+    openssl req -new -x509 -key "$SSXD_CA_KEY" -sha256 \
+        -subj "/CN=ssxpro-e2e-CA" \
+        -addext "basicConstraints=critical,CA:TRUE" \
+        -addext "keyUsage=critical,keyCertSign,cRLSign" \
+        -days 365 -out "$SSXD_CA_CERT" 2>/dev/null
+
+    # Convert host key seed to PKCS#8 DER for OpenSSL
+    # The host key is 32 raw seed bytes; wrap in PKCS#8 format
+    { printf '\x30\x2e\x02\x01\x00\x30\x05\x06\x03\x2b\x65\x70\x04\x22\x04\x20'
+      cat "$SSXD_HOST_KEY"
+    } > "$SSXD_SERVER_KEY.der"
+    # Convert DER to PEM for OpenSSL
+    openssl pkey -inform DER -in "$SSXD_SERVER_KEY.der" -out "$SSXD_SERVER_KEY" 2>/dev/null
+    chmod 600 "$SSXD_SERVER_KEY"
+    rm -f "$SSXD_SERVER_KEY.der"
+
+    # Generate server CSR with SAN for the test host
+    local san
+    if [[ "$HOST" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ || "$HOST" == *:* ]]; then
+        san="IP:$HOST"
+    else
+        san="IP:127.0.0.1,DNS:$HOST"
+    fi
+
+    openssl req -new -key "$SSXD_SERVER_KEY" -sha256 \
+        -subj "/CN=ssxpro-e2e-server" \
+        -addext "subjectAltName=$san" \
+        -addext "extendedKeyUsage=serverAuth" \
+        -addext "keyUsage=digitalSignature" \
+        -addext "basicConstraints=CA:FALSE" \
+        -out "$WORK/server.csr" 2>/dev/null
+
+    # Sign server certificate with CA
+    openssl x509 -req -in "$WORK/server.csr" -CA "$SSXD_CA_CERT" -CAkey "$SSXD_CA_KEY" \
+        -CAcreateserial -sha256 -days 90 \
+        -extfile <(cat <<EOF
+subjectAltName=$san
+extendedKeyUsage=serverAuth
+keyUsage=digitalSignature
+basicConstraints=CA:FALSE
+EOF
+) -out "$SSXD_SERVER_CERT" 2>/dev/null
+
+    # Create certificate chain (leaf + CA)
+    cat "$SSXD_SERVER_CERT" "$SSXD_CA_CERT" > "$SSXD_SERVER_CHAIN"
+
+    # An unrelated self-signed CA for negative tests: the client must reject
+    # the real server when it only trusts this one.
+    openssl genpkey -algorithm Ed25519 -out "$WORK/untrusted_ca_key.pem" 2>/dev/null
+    openssl req -new -x509 -key "$WORK/untrusted_ca_key.pem" -sha256 \
+        -subj "/CN=ssxpro-e2e-untrusted-CA" \
+        -addext "basicConstraints=critical,CA:TRUE" \
+        -addext "keyUsage=critical,keyCertSign,cRLSign" \
+        -days 365 -out "$SSXD_UNTRUSTED_CA_CERT" 2>/dev/null
+    rm -f "$WORK/untrusted_ca_key.pem"
+    chmod 600 "$SSXD_UNTRUSTED_CA_CERT"
+
+    # Clean up
+    rm -f "$WORK/server.csr" "$WORK/ca.srl"
+
+    log "TLS artifacts generated: CA=$SSXD_CA_CERT, chain=$SSXD_SERVER_CHAIN"
+}
 
 write_config() {
     local listen="$HOST:$PORT"
@@ -272,6 +372,8 @@ write_config() {
 # Generated by tests/bootstrap.sh — local e2e test configuration.
 listen: "$listen"
 host_key: "$SSXD_HOST_KEY"
+tls:
+  certificate_chain: "$SSXD_SERVER_CHAIN"
 compression: "$SSXD_COMPRESSION"
 workers: 1
 io:
@@ -284,7 +386,7 @@ auth:
   # The server-wide list is checked before the per-user file, so no
   # $HOME/.ssx permission choreography is needed for the test account.
   server_authorized_keys: "$SSXD_AUTHORIZED_KEYS"
-  allow_root: $ALLOW_ROOT
+  allow_root: true
 session:
   shell_path: "/bin/sh"
 log:
@@ -327,6 +429,22 @@ write_keys() {
     [ -n "$pin" ] || die 1 "could not derive the host key pin from $SSXD_HOST_KEY (openssl failed)"
     printf '%s:%s spki-sha256 %s\n' "$HOST" "$PORT" "$pin" > "$SSXD_KNOWN_HOSTS"
     chmod 600 "$SSXD_KNOWN_HOSTS"
+}
+
+write_client_config() {
+    cat > "$SSXD_CLIENT_CONFIG" <<YAML
+hosts: {}
+identity: "${PRESET_IDENTITY:-$SSXD_IDENTITY}"
+port: $PORT
+connect_timeout_secs: 10
+handshake_timeout_secs: 15
+known_hosts: "$SSXD_KNOWN_HOSTS"
+known_hosts_policy: "deny"
+tls:
+  ca_bundle: "$SSXD_CA_CERT"
+YAML
+    chmod 600 "$SSXD_CLIENT_CONFIG"
+    log "client config written to $SSXD_CLIENT_CONFIG"
 }
 
 # ---------------------------------------------------------------------------
@@ -399,16 +517,6 @@ stop_server() {
 }
 
 start_server() {
-    mkdir -p "$WORK"
-    chmod 700 "$WORK"
-
-    require_openssl
-    resolve_ssxd
-    check_test_user
-    export_test_env
-    write_config
-    write_keys
-
     # Refuse to stack a second server on the same artifacts; recover from
     # stale pid files (dead process, zombie, or a recycled pid).
     if [ -f "$SSXD_PID_FILE" ]; then
@@ -422,6 +530,18 @@ start_server() {
         warn "removing stale pid file $SSXD_PID_FILE"
         rm -f "$SSXD_PID_FILE"
     fi
+
+    mkdir -p "$WORK"
+    chmod 700 "$WORK"
+
+    require_openssl
+    resolve_ssxd
+    check_test_user
+    export_test_env
+    write_config
+    write_keys
+    generate_tls_artifacts
+    write_client_config
 
     preflight_check_config
 

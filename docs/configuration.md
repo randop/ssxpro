@@ -2,11 +2,15 @@
 
 Both programs deserialize YAML into strict, typed structures. Unknown keys and wrong types are errors; all omitted keys receive the defaults shown below. Range and cross-field errors identify the YAML key and line. Parser errors include the YAML parser's line and column.
 
-`ssxd` reads `/etc/ssx/ssxd.yaml` by default. `--config PATH` selects another file. `ssxd --check-config` validates YAML, requires the configuration and host-key files to be regular files owned by root with exact mode `0600`, opens them with `openat2(RESOLVE_NO_SYMLINKS)`, then reports kernel feature checks. The host key is exactly 32 raw Ed25519 seed bytes. `--yes-I-know-permission-risks-go-ahead-please` skips owner and mode checks for the configuration, host key, and both authorized_keys sources; use it only for unprivileged development.
+`ssxd` reads `/etc/ssx/ssxd.yaml` by default. `--config PATH` selects another file. `ssxd --check-config` validates YAML, requires the configuration and host-key files to be regular files owned by root with exact mode `0600`, opens them with `openat2(RESOLVE_NO_SYMLINKS)`, then reports kernel feature checks. The host key is exactly 32 raw Ed25519 seed bytes. When `tls.certificate_chain` is configured, it must be an absolute path to a regular root-owned file with exact mode `0644`, containing a PEM leaf certificate followed by any intermediate certificates. The leaf SPKI must match the monitor-held host key. `--yes-I-know-permission-risks-go-ahead-please` skips owner and mode checks for the configuration, host key, certificate chain, and authorized_keys sources; use it only for unprivileged development.
 
 ```yaml
 listen: "0.0.0.0:22"
 host_key: /etc/ssx/host_ed25519
+# Optional CA-issued PEM chain (leaf first, then intermediates); its leaf
+# public key must match host_key. The private key stays in the monitor.
+# tls:
+#   certificate_chain: /etc/ssx/server-fullchain.pem
 # PTY stream compression, enforced by the server:
 #   off      - no compression
 #   fast     - LZ4, optimized for low CPU utilization
@@ -71,10 +75,16 @@ idle_timeout_secs: 600
 server_alive_interval_secs: 15
 server_alive_count_max: 6
 known_hosts: /home/alice/.ssx/known_hosts
-known_hosts_policy: ask
+known_hosts_policy: deny
+tls:
+  # Optional private CA bundle. If omitted, strict SPKI pinning is still
+  # mandatory and is the trust mechanism for the self-signed default server.
+  # ca_bundle: /home/alice/.ssx/ssxpro-ca.pem
 ```
 
-Client `known_hosts_policy` is `deny`, `ask` (default), or `approve`. `deny` rejects a host that is not already pinned; `ask` prints the server key fingerprint and prompts `Allow this host? (y/N)`, accepting only an explicit `y` or `yes`; `approve` saves an unknown host key without prompting. A changed host key is always a fatal error. Accepted keys are appended to the secure default `~/.ssx/known_hosts` (directory mode `0700`, file mode `0600`); a custom `known_hosts` path must already contain the pin. `--approve-host` automatically approves and saves an unknown host key for one connection, overriding the configured policy.
+Client `known_hosts_policy` is `deny` (default) or `ask`. `deny` rejects a host that is not already pinned. `ask` requires the user to type the entire base64 SPKI SHA-256 fingerprint after comparing it with `ssxd --print-host-pin` through a trusted, independent channel; a simple yes/no response is not sufficient. Unknown pins are never saved silently, and a changed host key is always fatal. Accepted keys are appended only to the secure default `~/.ssx/known_hosts` (directory mode `0700`, file mode `0600`); a custom `known_hosts` path must already contain the pin. `--trust-new-host` enables the same guarded interactive enrollment for one connection. The old `--approve-host` spelling remains an alias but no longer auto-approves a key. The removed YAML value `approve` is rejected.
+
+`tls.ca_bundle` is optional. When configured, the client validates the server's certificate chain against that PEM trust bundle and independently validates the requested DNS name or IP against the certificate Subject Alternative Name. The mandatory SPKI known-hosts check is still performed before the client sends `Hello` or any authentication data. Without a CA bundle, the client uses strict SPKI pinning as the trust anchor for self-signed deployments; the TLS certificate itself is not CA-chain validated in that compatibility mode. For new deployments, prefer CA mode plus pre-provisioned pins. See [TLS and MITM security](tls-security.md) for provisioning and rotation procedures.
 
 The target is `USER@HOST[:PORT]` or a configured host alias. Bracket an IPv6 literal when supplying a port, for example `alice@[2001:db8::1]:2222`. A port in the target overrides an alias or config port; `--port` overrides both. Host aliases require a nonempty host. Alias fields inherit global port and identity when omitted.
 

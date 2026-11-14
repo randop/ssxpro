@@ -727,7 +727,7 @@ checksum = "199905e6153d6405f9728fe44daace35f8f837bbf830bb6e85fbd5828709a886"
 
 [[package]]
 name = "ssxpro-client"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64",
  "boring",
@@ -745,7 +745,7 @@ dependencies = [
 
 [[package]]
 name = "ssxpro-compression"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "lz4_flex",
  "snap",
@@ -755,7 +755,7 @@ dependencies = [
 
 [[package]]
 name = "ssxpro-config"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "yaml_serde",
@@ -763,7 +763,7 @@ dependencies = [
 
 [[package]]
 name = "ssxpro-crypto"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64",
  "boring",
@@ -773,7 +773,7 @@ dependencies = [
 
 [[package]]
 name = "ssxpro-io"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "io-uring",
  "libc",
@@ -781,12 +781,13 @@ dependencies = [
 
 [[package]]
 name = "ssxpro-proto"
-version = "0.1.1"
+version = "0.1.2"
 
 [[package]]
 name = "ssxpro-server"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
+ "base64",
  "boring",
  "boring-sys",
  "clap",

@@ -15,7 +15,7 @@ ssxpro provides public-key authenticated interactive login to one PTY-backed log
 
 ## Wire format
 
-QUIC provides confidentiality, integrity, peer transport authentication, stream ordering, and flow control. TLS 1.3 is carried inside QUIC by quiche/BoringSSL; there is no second encryption layer.
+QUIC provides confidentiality, integrity, peer transport authentication, stream ordering, and flow control. TLS 1.3 is carried inside QUIC by quiche/BoringSSL; there is no second encryption layer. Both endpoints constrain BoringSSL to TLS 1.3 only. TLS tickets and the session cache are disabled; protocol v1 does not support resumption or 0-RTT. The client must receive a server certificate and compare its SPKI to the pinned `known_hosts` identity before sending `Hello` or any application authentication data. With `tls.ca_bundle` configured, it additionally validates the certificate chain and the requested DNS/IP identity against SAN. Without a CA bundle, the pre-provisioned SPKI pin is the trust anchor for the built-in self-signed certificate; CA-chain and hostname validation are not performed.
 
 The client negotiates ALPN `ssxpro/1`. Stream 0 is the bidirectional control stream. Stream 4 is a bidirectional byte stream for PTY data. The client opens stream 4 immediately after `OpenShell` with a single 0x00 open marker; the server discards exactly that first byte. All remaining stream-4 bytes carry PTY data, either raw or in compression frames when the server selected a compression mode. QUIC flow control supplies backpressure. A stream 4 whose first byte is not 0x00, or a FIN before the marker, is a protocol error. All other stream IDs are forbidden in v1. The control stream is opened first and has priority over PTY data.
 
@@ -68,7 +68,7 @@ The signature is Ed25519 over the exact concatenation:
 "ssxpro-auth-v1" || server_nonce[32] || client_nonce[32] || server_spki_sha256[32] || username_utf8 || client_ed25519_public_key[32]
 ```
 
-The username is length-delimited in the wire message; for the signature input it is its UTF-8 bytes. Both nonces are generated independently with the OS CSPRNG. A fresh server nonce is required for every authentication attempt. The monitor checks the signature and authorized key. The known-hosts identity is SHA-256 of the DER SubjectPublicKeyInfo, not the certificate bytes.
+The username is length-delimited in the wire message; for the signature input it is its UTF-8 bytes. Both nonces are generated independently with the OS CSPRNG. A fresh server nonce is required for every authentication attempt. The monitor checks the signature and authorized key. The known-hosts identity is SHA-256 of the DER SubjectPublicKeyInfo, not the certificate bytes. Unknown host identities are rejected by default. Interactive enrollment requires the operator to compare and type the full SPKI SHA-256 fingerprint obtained through an independent trusted channel; silent first-use approval is not supported.
 
 **M0 spike result:** quiche's public `Connection` API does not expose TLS exporter material. BoringSSL has `SSL_export_keying_material`, but using it on QUIC's TLS object requires an API path through quiche; the upstream BoringSSL issue notes that ordinary SSL exporter calls on QUIC SSL objects historically failed. v1 therefore uses the nonce + SPKI construction above. Before changing this, M5 must prove exporter availability on both endpoints and bind the exporter label/context into the signed message. It must not silently switch binding modes.
 

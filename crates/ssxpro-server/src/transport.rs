@@ -449,6 +449,12 @@ fn start_tls_monitor(
             settings,
             *token_secret,
         );
+        if let Err(error) = &result {
+            // The parent only sees a closed identity socket; surface the
+            // real reason (bad chain, host-key mismatch, expired certificate)
+            // so startup failures are actionable.
+            eprintln!("ssxd: TLS monitor failed: {error}");
+        }
         // SAFETY: the forked monitor must not run inherited process destructors.
         unsafe { libc::_exit(if result.is_ok() { 0 } else { 1 }) }
     }
@@ -527,6 +533,7 @@ fn serve_worker(
         &tls_identity,
         tls_signer.clone(),
         u64::from(config.quic.idle_timeout_secs) * 1000,
+        config.tls.certificate_chain.as_deref(),
     )?;
     let (auth_sender, auth_receiver) = mpsc::sync_channel::<AuthJob>(8);
     let authorizer = tls_signer.clone();

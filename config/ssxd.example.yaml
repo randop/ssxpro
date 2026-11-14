@@ -1,5 +1,9 @@
 listen: "0.0.0.0:2222"
 host_key: "/etc/ssx/host_ed25519"
+# Optional CA-issued PEM chain: leaf first, then intermediate certificates.
+# The leaf public key MUST match host_key; the private key stays in the monitor.
+# tls:
+#   certificate_chain: "/etc/ssx/server-fullchain.pem"
 # PTY stream compression, enforced by the server:
 #   off      - no compression
 #   fast     - LZ4, optimized for low CPU utilization

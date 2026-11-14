@@ -16,6 +16,7 @@ ssxpro-io = { path = "../ssxpro-io" }
 ssxpro-config = { path = "../ssxpro-config" }
 ssxpro-compression = { path = "../ssxpro-compression" }
 clap.workspace = true
+base64.workspace = true
 libc.workspace = true
 quiche = { version = "=0.30.0", default-features = true }
 boring-sys = "=4.22.0"

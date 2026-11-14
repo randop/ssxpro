@@ -1,3 +1,5 @@
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use clap::Parser;
 use ssxpro_config::{default_server_config_path, parse_server_yaml, ServerConfig};
 use ssxpro_io::{probe_has_failures, probe_kernel, ProbeOptions};
@@ -32,6 +34,9 @@ struct Args {
     /// Validate the configuration, protected host key, and kernel capabilities; then exit.
     #[arg(long)]
     check_config: bool,
+    /// Print the server SPKI SHA-256 value as base64 for secure known_hosts provisioning.
+    #[arg(long)]
+    print_host_pin: bool,
     /// Skip config, host key, and authorized_keys permission checks
     #[arg(long = "yes-I-know-permission-risks-go-ahead-please")]
     skip_permission_checks: bool,
@@ -62,6 +67,16 @@ fn run(args: &Args) -> Result<(), (u8, String)> {
         parse_server_yaml(&config_text).map_err(|error| (EXIT_CONFIG, error.to_string()))?;
     check_server_files(&config, args.skip_permission_checks)
         .map_err(|error| (EXIT_CONFIG, error))?;
+    if args.print_host_pin {
+        let identity = crate::tls::identity_from_seed(
+            read_host_key_seed(&config.host_key).map_err(|error| (EXIT_CONFIG, error))?,
+        )
+        .map_err(|error| (EXIT_CONFIG, format!("cannot derive host SPKI: {error}")))?;
+        let digest = ssxpro_crypto::sha256(&identity.spki_der)
+            .map_err(|error| (EXIT_CONFIG, format!("cannot hash host SPKI: {error}")))?;
+        println!("{}", STANDARD.encode(digest));
+        return Ok(());
+    }
     let options = ProbeOptions {
         ring_entries: config.io.ring_entries,
         sqpoll_idle_ms: config.io.sqpoll_idle_ms,
@@ -135,6 +150,39 @@ fn check_server_files(config: &ServerConfig, skip_permission_checks: bool) -> Re
     })?;
     if metadata.len() != 32 {
         return Err("host key must contain exactly 32 raw Ed25519 seed bytes".to_owned());
+    }
+
+    if let Some(chain_path) = &config.tls.certificate_chain {
+        let chain = openat2_nosymlink(chain_path).map_err(|error| {
+            format!(
+                "cannot open TLS certificate chain {}: {error}",
+                chain_path.display()
+            )
+        })?;
+        if !skip_permission_checks {
+            // Certificates are public material, but ownership and a non-writable
+            // mode prevent an unprivileged local user from replacing the server
+            // identity after the initial configuration check.
+            check_secure_metadata(chain_path, &chain, 0, 0o644, "TLS certificate chain")?;
+        }
+        let chain_metadata = chain.metadata().map_err(|error| {
+            format!(
+                "cannot inspect TLS certificate chain {}: {error}",
+                chain_path.display()
+            )
+        })?;
+        if chain_metadata.len() == 0 || chain_metadata.len() > 256 * 1024 {
+            return Err("TLS certificate chain must be 1..=262144 bytes".to_owned());
+        }
+        let mut pem = Vec::with_capacity(chain_metadata.len() as usize);
+        chain
+            .take(256 * 1024 + 1)
+            .read_to_end(&mut pem)
+            .map_err(|error| format!("cannot read TLS certificate chain: {error}"))?;
+        let host_identity = crate::tls::identity_from_seed(read_host_key_seed(&config.host_key)?)
+            .map_err(|error| format!("cannot derive host SPKI: {error}"))?;
+        crate::tls::validate_certificate_chain_pem(&pem, &host_identity.spki_der)
+            .map_err(|error| format!("invalid TLS certificate chain: {error}"))?;
     }
     Ok(())
 }
@@ -243,6 +291,7 @@ mod tests {
         let args = Args {
             config: PathBuf::from("/ssxpro-test-config-does-not-exist.yaml"),
             check_config: true,
+            print_host_pin: false,
             skip_permission_checks: false,
             verbose: 0,
         };
