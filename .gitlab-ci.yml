@@ -131,3 +131,26 @@ build:arm64:
       - target/aarch64-unknown-linux-gnu/release/ssxd
     expire_in: 1 week
 
+# ==================================================
+# M10 performance regression (nightly, privileged)
+# ==================================================
+# Requires a runner with CAP_NET_ADMIN / nested netns and a pre-built
+# release artifact. Uncomment and attach to a tagged runner once the
+# interactive drivers in scripts/bench/ are wired and the first baseline
+# numbers are published in docs/performance.md.
+#
+# bench:nightly:
+#   stage: build
+#   tags: [bench, privileged]
+#   rules:
+#     - if: $CI_PIPELINE_SOURCE == "schedule"
+#   script:
+#     - ./scripts/cargo-pinned.sh build --release --locked
+#     - sudo scripts/bench/run-all.sh --profile lan --out target/bench/ci
+#     # Compare target/bench/ci/*/results.jsonl against thresholds in
+#     # docs/performance.md; exit non-zero on >5% regression.
+#   artifacts:
+#     paths:
+#       - target/bench/ci/
+#     when: always
+#     expire_in: 2 weeks
