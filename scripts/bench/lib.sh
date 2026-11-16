@@ -35,22 +35,30 @@ run_id() {
 
 meta_json() {
   local out="$1"
-  cat >"$out" <<EOF
-{
-  "commit": "$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)",
-  "kernel": "$(uname -r)",
-  "cpu": "$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | xargs || echo unknown)",
-  "nproc": $(nproc),
-  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-  "ssxd": "$SSXD_BIN",
-  "ssx": "$SSX_BIN"
-}
-EOF
+  need_cmd python3
+  python3 - "$out" \
+    "$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)" \
+    "$(uname -r)" \
+    "$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | xargs || echo unknown)" \
+    "$(nproc)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$SSXD_BIN" "$SSX_BIN" <<'PYTHON'
+import json
+import re
+import sys
+
+out, commit, kernel, cpu, cores, timestamp, ssxd, ssx = sys.argv[1:]
+if not re.fullmatch(r"[1-9][0-9]*", cores):
+    sys.exit("bench: invalid processor count: " + cores)
+with open(out, "w") as stream:
+    json.dump(dict(commit=commit, kernel=kernel, cpu=cpu, nproc=int(cores),
+                   timestamp=timestamp, ssxd=ssxd, ssx=ssx), stream, indent=2)
+    stream.write("\n")
+PYTHON
 }
 
 write_summary_header() {
   local dir="$1"
   local title="$2"
+  : >"$dir/results.jsonl"
   {
     echo "# $title"
     echo
@@ -68,8 +76,33 @@ append_result() {
   local name="$2"
   local value="$3"
   local unit="${4:-}"
+  local value_type="${5:-number}"
+  need_cmd python3
+  # Serialize and validate before appending either artifact.
+  local result
+  result=$(python3 - "$name" "$value" "$unit" "$value_type" <<'PYTHON'
+import json
+import math
+import sys
+
+name, raw, unit, kind = sys.argv[1:]
+if kind == "string":
+    value = raw
+elif kind == "number":
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        sys.exit("bench: invalid numeric result: " + raw)
+    if value is not None and (type(value) not in (int, float) or
+                              (isinstance(value, float) and not math.isfinite(value))):
+        sys.exit("bench: expected a finite number or null: " + raw)
+else:
+    sys.exit("bench: unknown result type: " + kind)
+print(json.dumps(dict(metric=name, value=value, unit=unit), allow_nan=False))
+PYTHON
+  ) || return
   echo "- **$name**: $value${unit:+ $unit}" >>"$dir/summary.md"
-  echo "{\"metric\":\"$name\",\"value\":$value,\"unit\":\"$unit\"}" >>"$dir/results.jsonl"
+  printf '%s\n' "$result" >>"$dir/results.jsonl"
 }
 
 # Simple percentile helper from a sorted numeric list on stdin.

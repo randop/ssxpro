@@ -71,17 +71,8 @@ KNOWN_HOSTS="$WORK/known_hosts"
 SSXD_CFG="$WORK/ssxd.yaml"
 CLIENT_CFG="$WORK/ssx.yaml"
 
-# Generate a throw-away Ed25519 seed pair if the real binaries support keygen.
-# Fall back to a fixed test vector only when the harness is dry-run.
-if "$SSX_BIN" keygen --force --path "$IDENTITY" >/dev/null 2>&1; then
-  true
-else
-  # 32-byte zero seed is rejected by production code; the e2e bootstrap
-  # already knows how to produce valid material. For a pure harness
-  # skeleton we document the requirement and exit cleanly when keys are
-  # missing.
-  die "ssx keygen failed; produce $IDENTITY and matching authorized_keys manually"
-fi
+# Identity material must be provisioned before running the harness.
+[[ -f "$IDENTITY" ]] || die "identity missing: $IDENTITY; provision it and matching authorized_keys manually"
 
 # Host key: reuse the same generator if available, else expect pre-provisioned.
 if [[ ! -f "$HOST_KEY" ]]; then

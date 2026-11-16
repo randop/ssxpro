@@ -27,7 +27,7 @@ Usage: $0 [options]
 
   --profile PROFILE   netem profile (lan|metro|wan|lossy), default lan
   --openssh           also run OpenSSH comparison
-  --flame             capture flamegraphs after the main workloads
+  --flame             print manual flamegraph capture instructions
   --out DIR           result directory (default: target/bench/<timestamp>)
 EOF
       exit 0

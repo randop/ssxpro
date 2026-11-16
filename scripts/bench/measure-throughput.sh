@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Bulk throughput: cat /dev/zero | ssx ... 'cat > /dev/null' and the reverse.
+# Bulk throughput: pending a measurement driver for the PTY-shell interface.
 #
 # Usage:
 #   measure-throughput.sh [--profile lan] [--seconds 30] [--out DIR]
@@ -47,11 +47,9 @@ if [[ $USE_NETNS -eq 1 ]]; then
   "$SCRIPT_DIR/netns-setup.sh" up --profile "$PROFILE"
 fi
 
-# The real measurement drives:
-#   client:  timeout $SECONDS_RUN cat /dev/zero | ssx user@$SERVER_IP "cat >/dev/null"
-#   and the reverse direction with a remote `cat /dev/zero`.
-# Both need a live authenticated session; the e2e bootstrap already
-# knows how to start one. This skeleton records the intended protocol.
+# Measurement is pending a PTY-shell driver that configures the remote
+# terminal, transfers counted data in both directions, and times completion.
+# ssx does not support passing a remote command on its command line.
 
 append_result "$OUT" "tx_mib_per_s" "null" "MiB/s (not measured)"
 append_result "$OUT" "rx_mib_per_s" "null" "MiB/s (not measured)"
@@ -59,4 +57,4 @@ append_result "$OUT" "duration_s" "$SECONDS_RUN" "s"
 
 echo "Throughput harness skeleton ready at $OUT"
 echo "Wire against a live session (tests/bootstrap.sh + ssx) to obtain numbers."
-echo "See docs/performance.md for the exact command shapes."
+echo "See docs/performance.md for the pending PTY measurement requirements."

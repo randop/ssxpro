@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Capture a flamegraph of the server or client under a given workload.
 #
-# Requires: perf, and flamegraph.pl on PATH (or FLAMEGRAPH_PL).
+# Requires: perf, stackcollapse-perf.pl, and flamegraph.pl on PATH (or FLAMEGRAPH_PL).
 #
 # Usage:
 #   flamegraph.sh --side server|client --duration 30 --workload latency|bulk|idle
@@ -32,6 +32,10 @@ done
 need_cmd perf
 FLAMEGRAPH_PL="${FLAMEGRAPH_PL:-$(command -v flamegraph.pl || true)}"
 [[ -n "$FLAMEGRAPH_PL" ]] || die "flamegraph.pl not found (set FLAMEGRAPH_PL)"
+need_cmd "$FLAMEGRAPH_PL"
+STACKCOLLAPSE_PERF_PL="${STACKCOLLAPSE_PERF_PL:-$(command -v stackcollapse-perf.pl || true)}"
+[[ -n "$STACKCOLLAPSE_PERF_PL" ]] || die "stackcollapse-perf.pl not found (set STACKCOLLAPSE_PERF_PL)"
+need_cmd "$STACKCOLLAPSE_PERF_PL"
 
 if [[ -z "$OUT" ]]; then
   OUT="$BENCH_ROOT/$(run_id)-flame-$SIDE-$WORKLOAD"
@@ -49,8 +53,9 @@ fi
 [[ -n "$PID" ]] || die "no $SIDE process found; start it or pass --pid"
 
 echo "Recording perf for pid $PID (${DURATION}s, workload=$WORKLOAD) ..."
-perf record -F 99 -p "$PID" -g -- sleep "$DURATION"
-perf script >"$OUT/perf.script"
-"$FLAMEGRAPH_PL" "$OUT/perf.script" >"$OUT/flame.svg"
+perf record -o "$OUT/perf.data" -F 99 -p "$PID" -g -- sleep "$DURATION"
+perf script -i "$OUT/perf.data" >"$OUT/perf.script"
+"$STACKCOLLAPSE_PERF_PL" "$OUT/perf.script" >"$OUT/perf.folded"
+"$FLAMEGRAPH_PL" "$OUT/perf.folded" >"$OUT/flame.svg"
 echo "Flamegraph written to $OUT/flame.svg"
-append_result "$OUT" "flamegraph" "\"$OUT/flame.svg\"" ""
+append_result "$OUT" "flamegraph" "$OUT/flame.svg" "" string

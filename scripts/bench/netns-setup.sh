@@ -71,10 +71,18 @@ cmd_up() {
   # Tear down any leftover namespaces first
   cmd_down 2>/dev/null || true
 
+  # Track only a pair successfully created by this invocation. Install rollback
+  # before allocation so a failed move cannot strand an endpoint on the host.
+  VETH_OWNED=0
+  trap 'cmd_down' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
   ip netns add "$CLIENT_NS"
   ip netns add "$SERVER_NS"
 
   ip link add "$VETH_C" type veth peer name "$VETH_S"
+  VETH_OWNED=1
   ip link set "$VETH_C" netns "$CLIENT_NS"
   ip link set "$VETH_S" netns "$SERVER_NS"
 
@@ -87,6 +95,7 @@ cmd_up() {
 
   apply_netem "$SERVER_NS" "$PROFILE"
 
+  trap - EXIT INT TERM
   echo "netns ready: client=$CLIENT_NS ($CLIENT_IP) server=$SERVER_NS ($SERVER_IP) profile=$PROFILE"
 }
 
@@ -94,7 +103,12 @@ cmd_down() {
   need_root
   ip netns del "$CLIENT_NS" 2>/dev/null || true
   ip netns del "$SERVER_NS" 2>/dev/null || true
-  # veths are deleted with their namespaces
+  # Namespace deletion removes moved endpoints. Delete any owned endpoints
+  # left on the host after a failed move, but never a pre-existing host device.
+  if [[ ${VETH_OWNED:-0} -eq 1 ]]; then
+    ip link del "$VETH_C" 2>/dev/null || true
+    ip link del "$VETH_S" 2>/dev/null || true
+  fi
   echo "netns torn down"
 }
 
