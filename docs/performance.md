@@ -13,10 +13,6 @@ Status: M10 scaffolding (2026-11-15). Baselines not yet recorded on production-c
 
 ## Metrics
 
-<!-- coderabbit-ai-generated:v1 -->
-
-<!-- coderabbit-ai-generated-section:v1:a3de62b87ff3e1ad78e089b337c8dbfee8a083fed5304923d46dbd706f0a33cc -->
-
 | Metric | How measured | Notes |
 |--------|--------------|-------|
 | Full handshakes / s / core | Parallel `ssx` connections that complete auth + `OpenShell` then exit | Exclude warm-up; report median of ≥5 runs |
@@ -24,8 +20,6 @@ Status: M10 scaffolding (2026-11-15). Baselines not yet recorded on production-c
 | Bulk throughput / core | Pending a throughput driver through the supported PTY-shell interface | Driver must configure terminal modes, count transferred bytes in both directions, and time completion; report MiB/s after QUIC warm-up |
 | CPU & RSS per connection | 1k / 10k / 50k idle authenticated sessions | `ps` / `smem` / cgroup; workers pinned |
 | Syscalls / s, context switches, cache misses | `bpftrace`, `perf stat` during steady keystroke and bulk loads | Capture both client and server |
-
-<!-- /coderabbit-ai-generated:v1 -->
 
 All numbers are recorded for:
 
@@ -81,13 +75,7 @@ sudo scripts/bench/run-all.sh --profile wan --openssh
 sudo scripts/bench/measure-latency.sh --profile lan --iterations 5000
 ```
 
-<!-- coderabbit-ai-generated:v1 -->
-
-<!-- coderabbit-ai-generated-section:v1:66ff6244e382d4e86bc0ef2512d76857684b61d9cfeb82348eef4697194acf0e -->
-
 Results are JSON lines under `target/bench/<run-id>/` plus a human-readable `summary.md`. `run-all.sh --flame` only prints instructions; it does not capture flamegraphs. Start a live workload and capture manually with `scripts/bench/flamegraph.sh` (see below).
-
-<!-- /coderabbit-ai-generated:v1 -->
 
 ### Privileges
 
@@ -144,15 +132,9 @@ sudo scripts/bench/flamegraph.sh --side server --duration 30 --workload latency
 sudo scripts/bench/flamegraph.sh --side client --duration 30 --workload bulk
 ```
 
-<!-- coderabbit-ai-generated:v1 -->
-
-<!-- coderabbit-ai-generated-section:v1:1872925f82b1013958fab134739a47af85c2b460f0531bc354d052ec854113b4 -->
-
 Start the server or client under the desired workload first; this script profiles an existing process and does not generate the workload. Use `--pid PID` to select it explicitly.
 
 Requires `perf`, `stackcollapse-perf.pl`, and `flamegraph.pl` on `PATH` (or set `STACKCOLLAPSE_PERF_PL` and `FLAMEGRAPH_PL` to their executable paths). The script records `perf.data`, converts it to `perf.script`, collapses it to `perf.folded`, and renders `flame.svg` in its output directory. Use `--out DIR` to select that directory; the default is `$BENCH_ROOT/<UTC-timestamp>-flame-<side>-<workload>/`, with `BENCH_ROOT` defaulting to `target/bench` under the repository root.
-
-<!-- /coderabbit-ai-generated:v1 -->
 
 ## Reproducing a published number
 
