@@ -1,6 +1,6 @@
 # ssxpro — P-RAN-11
 
-Status: In progress (2026-11-12) — M0–M3 complete; M5 functional end-to-end including server-enforced PTY compression; M4, M6, M7 partial; M8/M9 foundations only; M10 backlog; M11 docs partial.
+Status: In progress (2026-11-15) — M0–M3 complete; M5 functional end-to-end including server-enforced PTY compression; M4, M6, M7 partial; M8/M9 foundations only; M10 harness + docs scaffolding; M11 docs partial.
 
 ## Overview
 
@@ -57,7 +57,7 @@ Status: In progress (2026-11-12) — M0–M3 complete; M5 functional end-to-end 
 
 ## Milestones (one issue each)
 
-M0 spec and scaffold — **Done**; M1 config — **Done**; M2 crypto and keys — **Done** (host-key `memfd_secret` deferred); M3 proto — **Done** (property/fuzz-CI items open); M4 ring runtime — **In progress**; M5 end-to-end — **In progress** (functional including compression, verification gaps); M6 monitor and PTY — **In progress**; M7 client UX — **In progress**; M8 multi-worker and steering — **In progress** (foundations only); M9 hardening — **In progress** (partial layers); M10 performance — **Backlog**; M11 packaging and docs — **Backlog** (docs partial).
+M0 spec and scaffold — **Done**; M1 config — **Done**; M2 crypto and keys — **Done** (host-key `memfd_secret` deferred); M3 proto — **Done** (property/fuzz-CI items open); M4 ring runtime — **In progress**; M5 end-to-end — **In progress** (functional including compression, verification gaps); M6 monitor and PTY — **In progress**; M7 client UX — **In progress**; M8 multi-worker and steering — **In progress** (foundations only); M9 hardening — **In progress** (partial layers); M10 performance — **In progress** (harness + docs scaffolding); M11 packaging and docs — **Backlog** (docs partial).
 
 **Assisted By:** Anthropic Claude Sonnet 5.5
 
@@ -530,7 +530,7 @@ Shrink what a compromised pre-auth worker can do, using layered Linux mechanisms
 
 ## RAN-198 — M10: Performance: baselines, benchmarks, tuning
 
-Status: Backlog
+Status: In progress (harness + docs scaffolding)
 Priority: No priority
 
 ## Goal
@@ -564,13 +564,26 @@ Measure, then tune. "Blazing fast" must be a number, not a feeling.
 
 **Deliverables:** a repeatable benchmark harness (netns plus `tc netem` for loss/latency profiles), flamegraphs, a tuning guide, and numeric targets agreed after the baselines.
 
+## Progress
+
+* `docs/performance.md` added: metrics definitions, netem profiles, tuning-lever table, numeric-target template, CI regression policy, flamegraph usage, and reproduction metadata requirements.
+* `scripts/bench/` harness skeleton:
+  * `netns-setup.sh` — client/server netns + veth + `tc netem` profiles (`lan` / `metro` / `wan` / `lossy`)
+  * `measure-handshake.sh`, `measure-latency.sh`, `measure-throughput.sh`, `measure-idle.sh`
+  * `compare-openssh.sh` for the OpenSSH TCP baseline on the same path
+  * `flamegraph.sh` (`perf` + `flamegraph.pl`)
+  * `run-all.sh` orchestrator and `lib.sh` helpers (JSONL results, summary.md, commit/kernel metadata)
+* Interactive PTY drivers (keystroke timing, bulk transfer, multi-connection idle) still need to be wired against the same bootstrap material used by `tests/ssx_e2e.py` / `tests/bootstrap.sh`. Numbers remain placeholders until that step and a hardware baseline run.
+
 ## Acceptance criteria
 
 - [ ] Baseline and tuned results published in `docs/performance.md`
 - [ ] Every enabled-by-default feature has a measured win; losing ones stay opt-in or are dropped
 - [ ] Regression benchmark runs in CI nightly with a threshold alert
+- [x] Repeatable harness and tuning guide scaffolding present
 
 **Assisted By:** Anthropic Claude Sonnet 5.5
+**Assisted By:** Grok (xAI)
 
 ---
 
